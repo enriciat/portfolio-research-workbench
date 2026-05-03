@@ -92,3 +92,15 @@ app.py
 - Standalone generated HTML reports can be very large and sometimes render blank inside Streamlit if their JavaScript expects a full browser page. Use the safe internal preview or download the report.
 - Portfolio optimizers are decision-support tools, not guarantees. Use the validation-period mode and synthetic stress tests to reduce overfitting risk.
 - Parallel workers are useful for local cached data. If many strategies need online API/Yahoo fallback, reduce worker count to avoid rate limits.
+
+## New decision-engine additions
+
+This version adds the decision-oriented portfolio tools from the Strategy Weighting project ideas:
+
+- **Correlation Requirement Lab**: estimates the maximum useful correlation each strategy/pair can tolerate before it stops improving Sharpe or volatility, plus correlation safety-margin heatmaps and portfolio-level correlation breakpoints.
+- **Efficient Frontier & Allocation Map**: generates random portfolios, marks an approximate efficient frontier, shows the active portfolio, and visualizes allocations along the frontier.
+- **Robustness Lab**: reruns portfolio objectives by calendar year to show allocation stability and whether optimizers keep selecting the same strategies or chase noise.
+- **Portfolio Decision page**: combines historical metrics, transparent decision-score components, correlation safety, and optional Monte Carlo candidate comparison to shortlist the portfolios that are most likely worth running.
+- **Research workbook export**: creates an XLSX workbook containing decision tables, candidate metrics, correlation requirements, stress breakpoints, frontier data, robustness outputs, and Monte Carlo comparison outputs.
+
+The app is still a decision-support tool, not a guarantee. Its strongest use is comparing candidate portfolios under explicit assumptions and showing where those assumptions break.

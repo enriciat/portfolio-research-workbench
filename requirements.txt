@@ -7,3 +7,4 @@ yfinance>=0.2.40
 lxml>=5.0
 plotly>=5.22
 scipy>=1.10
+xlsxwriter>=3.2
