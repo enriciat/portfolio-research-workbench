@@ -268,8 +268,10 @@ def random_weight_search(
         )
     else:
         score = sharpe
-    corr = r.corr().fillna(0.0).clip(lower=0.0).values
-    np.fill_diagonal(corr, 0.0)
+    corr = r.corr().fillna(0.0).clip(lower=0.0).to_numpy(copy=True)
+    # Streamlit Cloud may run a NumPy/Pandas combination where .values returns
+    # a read-only view; copy explicitly before mutating the diagonal.
+    corr[np.diag_indices_from(corr)] = 0.0
     weighted_corr_penalty = np.einsum("ij,jk,ik->i", W, corr, W)
     score = np.nan_to_num(score, nan=-1e9, neginf=-1e9, posinf=1e9)
     score -= concentration_penalty * np.sum(W * W, axis=1)

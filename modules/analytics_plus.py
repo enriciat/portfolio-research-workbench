@@ -294,8 +294,10 @@ def similarity_pairs(returns: pd.DataFrame, threshold: float = 0.90) -> pd.DataF
 def cluster_linkage(returns: pd.DataFrame):
     corr = returns.corr().fillna(0)
     dist = np.sqrt(2 * (1 - corr)).clip(lower=0)
-    np.fill_diagonal(dist.values, 0)
-    return hierarchy.linkage(squareform(dist.values, checks=False), method="ward")
+    dist_arr = dist.to_numpy(copy=True)
+    # Copy before mutating; some Pandas/NumPy versions expose read-only views.
+    dist_arr[np.diag_indices_from(dist_arr)] = 0.0
+    return hierarchy.linkage(squareform(dist_arr, checks=False), method="ward")
 
 
 def rolling_corr(returns: pd.DataFrame, left: str, right: str, window: int = 63) -> pd.Series:
