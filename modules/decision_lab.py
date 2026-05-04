@@ -209,7 +209,19 @@ def _fast_random_search(returns: pd.DataFrame, objective: str, max_weight: float
         elif objective == "Min cVaR":
             score = m.get("cVaR 95", -1e9)
         elif objective == "Robust Recommended":
-            score = 1.1*m.get("CAGR",0)+0.8*m.get("Sharpe",0)+0.8*m.get("Calmar",0)+1.5*m.get("Max Drawdown",0)+3*m.get("cVaR 95",0)-0.3*float((w**2).sum())
+            # Use Ulcer Index internally for drawdown persistence instead of a
+            # direct max-drawdown-only penalty. It is not exposed as a general
+            # metric column in the UI.
+            p_ret = pl.portfolio_returns(r, w, "candidate")
+            ui = pl.ulcer_index(p_ret)
+            score = (
+                1.1*m.get("CAGR", 0)
+                + 0.8*m.get("Sharpe", 0)
+                + 0.8*m.get("Calmar", 0)
+                - 1.75*(ui if np.isfinite(ui) else 0.0)
+                + 3*m.get("cVaR 95", 0)
+                - 0.3*float((w**2).sum())
+            )
         else:
             score = m.get("Sharpe", -1e9)
         if np.isfinite(score) and score > best_score:
@@ -305,7 +317,9 @@ def final_decision_table(metrics: pd.DataFrame, corr_req: pd.DataFrame, stress_c
     out["Return Score"] = rank(df.get("CAGR", pd.Series(index=df.index, dtype=float)), True)
     out["Risk Score"] = (rank(df.get("Max Drawdown", pd.Series(index=df.index, dtype=float)), True) + rank(df.get("cVaR 95", pd.Series(index=df.index, dtype=float)), True)) / 2
     out["Risk-Adjusted Score"] = (rank(df.get("Sharpe", pd.Series(index=df.index, dtype=float)), True) + rank(df.get("Calmar", pd.Series(index=df.index, dtype=float)), True)) / 2
-    out["Concentration Penalty"] = rank(df.get("Concentration HHI", pd.Series(index=df.index, dtype=float)), False) * 0.35 if "Concentration HHI" in df else 0.0
+    # Higher HHI means more concentration, so the penalty must be larger for
+    # higher HHI.  The previous descending rank inverted this penalty.
+    out["Concentration Penalty"] = rank(df.get("Concentration HHI", pd.Series(index=df.index, dtype=float)), True) * 0.35 if "Concentration HHI" in df else 0.0
     if mc_comp is not None and not mc_comp.empty:
         mc = mc_comp.reindex(out.index)
         out["MC Downside Score"] = (rank(mc.get("5% CAGR", pd.Series(index=out.index, dtype=float)), True) + rank(mc.get("5% Max DD", pd.Series(index=out.index, dtype=float)), True)) / 2

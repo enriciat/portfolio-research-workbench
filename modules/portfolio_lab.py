@@ -70,6 +70,19 @@ def drawdowns(series: pd.Series) -> pd.Series:
     return wealth / peak - 1.0
 
 
+def ulcer_index(series: pd.Series) -> float:
+    """Internal RMS drawdown penalty used by Robust Recommended.
+
+    The value is intentionally not exposed as a general table metric; it is used
+    only to make the Robust Recommended objective account for drawdown depth and
+    persistence rather than relying on a single worst point.
+    """
+    dd = drawdowns(series)
+    if dd.empty:
+        return np.nan
+    return float(np.sqrt(np.nanmean(np.square(dd.values))))
+
+
 def cvar(series: pd.Series, alpha: float = 0.05) -> float:
     s = series.dropna()
     if s.empty:
@@ -226,6 +239,7 @@ def random_weight_search(
     peak = np.maximum.accumulate(wealth, axis=0)
     dd = wealth / np.maximum(peak, 1e-16) - 1.0
     maxdd = np.nanmin(dd, axis=0)
+    ulcer = np.sqrt(np.nanmean(dd * dd, axis=0))
     calmar = np.divide(cagr, np.abs(maxdd), out=np.full_like(cagr, np.nan), where=maxdd < 0)
     q = np.nanquantile(P, 0.05, axis=0)
     cvars = np.array([np.nanmean(P[:, j][P[:, j] <= q[j]]) if np.any(P[:, j] <= q[j]) else q[j] for j in range(P.shape[1])])
@@ -241,14 +255,25 @@ def random_weight_search(
     elif objective == "min_cvar":
         score = cvars
     elif objective == "robust":
-        score = 1.25 * np.nan_to_num(cagr) + 0.60 * np.nan_to_num(sharpe) + 0.35 * np.nan_to_num(calmar) + 1.40 * np.nan_to_num(maxdd) + 4.00 * np.nan_to_num(cvars)
+        # Robust Recommended: blend upside/risk-adjusted return with left-tail
+        # risk, concentration, and drawdown persistence.  The direct drawdown
+        # penalty is Ulcer Index, not only max drawdown, so long underwater
+        # periods are penalized even if their single worst point is not extreme.
+        score = (
+            1.25 * np.nan_to_num(cagr)
+            + 0.60 * np.nan_to_num(sharpe)
+            + 0.35 * np.nan_to_num(calmar)
+            - 1.75 * np.nan_to_num(ulcer)
+            + 4.00 * np.nan_to_num(cvars)
+        )
     else:
         score = sharpe
-    corr = r.corr().fillna(0.0)
-    avg_corr = float(corr.where(np.triu(np.ones(corr.shape), 1).astype(bool)).stack().mean()) if n > 1 else 0.0
+    corr = r.corr().fillna(0.0).clip(lower=0.0).values
+    np.fill_diagonal(corr, 0.0)
+    weighted_corr_penalty = np.einsum("ij,jk,ik->i", W, corr, W)
     score = np.nan_to_num(score, nan=-1e9, neginf=-1e9, posinf=1e9)
     score -= concentration_penalty * np.sum(W * W, axis=1)
-    score -= tail_corr_penalty * max(avg_corr, 0.0)
+    score -= tail_corr_penalty * weighted_corr_penalty
     best_idx = int(np.argmax(score))
     return normalize_weights(pd.Series(W[best_idx], index=cols), cols, max_weight)
 
