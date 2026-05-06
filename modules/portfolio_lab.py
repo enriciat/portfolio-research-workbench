@@ -21,6 +21,14 @@ def clean_returns(returns: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_weights(weights: pd.Series | Dict[str, float], columns: Optional[List[str]] = None, max_weight: float = 1.0) -> pd.Series:
+    """Normalize non-negative scores into weights, then apply max-weight caps.
+
+    Important: raw inverse-risk scores (for example 1 / volatility) can be much
+    larger than a portfolio max-weight cap.  Clipping before normalization would
+    destroy relative risk information and can incorrectly collapse inverse-risk
+    methods to equal weight.  Therefore the order is: clean -> normalize -> cap
+    -> redistribute leftover weight among uncapped names.
+    """
     if isinstance(weights, dict):
         w = pd.Series(weights, dtype=float)
     else:
@@ -28,29 +36,47 @@ def normalize_weights(weights: pd.Series | Dict[str, float], columns: Optional[L
     if columns is not None:
         w = w.reindex(columns).fillna(0.0)
     w = w.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
-    if max_weight < 1.0:
-        w = w.clip(upper=max_weight)
+    if len(w) == 0:
+        return w
     if float(w.sum()) <= 0:
-        if len(w) == 0:
-            return w
         w[:] = 1.0 / len(w)
     else:
-        w = w / w.sum()
-    # Clip once more and renormalize for max-weight constraints.
-    if max_weight < 1.0:
-        for _ in range(50):
-            over = w > max_weight + 1e-12
-            if not over.any():
-                break
-            fixed = w[over].clip(upper=max_weight)
-            remaining = 1.0 - fixed.sum()
-            rest = w[~over]
-            if len(rest) == 0 or remaining <= 0:
-                w = fixed.reindex(w.index).fillna(0.0)
-                break
-            rest = rest / rest.sum() * remaining if rest.sum() > 0 else pd.Series(remaining / len(rest), index=rest.index)
-            w = pd.concat([fixed, rest]).reindex(w.index).fillna(0.0)
-    return w / w.sum() if w.sum() > 0 else w
+        w = w / float(w.sum())
+
+    max_weight = float(max_weight)
+    if max_weight <= 0:
+        return pd.Series(1.0 / len(w), index=w.index)
+    if max_weight >= 1.0 or len(w) == 1:
+        return w / w.sum() if w.sum() > 0 else w
+    # If the requested cap is mathematically infeasible, equal weight is the
+    # least-surprising feasible fallback even if it slightly exceeds the cap.
+    if max_weight * len(w) < 1.0 - 1e-12:
+        return pd.Series(1.0 / len(w), index=w.index)
+
+    final = pd.Series(0.0, index=w.index)
+    active = pd.Series(True, index=w.index)
+    remaining = 1.0
+    base_scores = w.copy()
+    for _ in range(len(w) + 2):
+        active_idx = active[active].index
+        if len(active_idx) == 0 or remaining <= 1e-12:
+            break
+        scores = base_scores.loc[active_idx]
+        if scores.sum() <= 0:
+            proposed = pd.Series(remaining / len(active_idx), index=active_idx)
+        else:
+            proposed = scores / scores.sum() * remaining
+        over = proposed > max_weight + 1e-12
+        if not over.any():
+            final.loc[active_idx] = proposed
+            break
+        over_idx = proposed[over].index
+        final.loc[over_idx] = max_weight
+        remaining = 1.0 - final.sum()
+        active.loc[over_idx] = False
+    if final.sum() <= 0:
+        final[:] = 1.0 / len(final)
+    return final / final.sum()
 
 
 def portfolio_returns(returns: pd.DataFrame, weights: pd.Series | Dict[str, float], name: str = "Portfolio") -> pd.Series:
@@ -290,6 +316,38 @@ def tail_risk_parity_weights(returns: pd.DataFrame, max_weight: float = 1.0) -> 
         vals[c] = 1.0 / risk if risk and np.isfinite(risk) and risk > 0 else 0.0
     return normalize_weights(vals, list(r.columns), max_weight)
 
+
+
+
+def inverse_risk_diagnostics(returns: pd.DataFrame, method: str, max_weight: float = 1.0) -> pd.DataFrame:
+    """Show raw risk inputs, uncapped weights, and final capped weights.
+
+    method = "inverse_volatility" or "tail_risk_parity".
+    """
+    r = clean_returns(returns)
+    rows = []
+    raw_scores = {}
+    for c in r.columns:
+        if method == "tail_risk_parity":
+            cv = abs(cvar(r[c]))
+            md = abs(float(drawdowns(r[c]).min())) if r[c].dropna().size else np.nan
+            risk = np.nanmean([cv, md / 20 if np.isfinite(md) else np.nan])
+            label = "Tail Risk Input"
+        else:
+            risk = float(r[c].std()) if r[c].dropna().size else np.nan
+            label = "Volatility Input"
+        score = 1.0 / risk if risk and np.isfinite(risk) and risk > 0 else 0.0
+        raw_scores[c] = score
+        rows.append({"Strategy": c, label: risk, "Inverse-Risk Score": score})
+    if not rows:
+        return pd.DataFrame()
+    raw = pd.Series(raw_scores, dtype=float)
+    uncapped = raw / raw.sum() if raw.sum() > 0 else pd.Series(1.0 / len(raw), index=raw.index)
+    final = normalize_weights(raw, list(r.columns), max_weight)
+    out = pd.DataFrame(rows).set_index("Strategy")
+    out["Uncapped Normalized Weight"] = uncapped.reindex(out.index).fillna(0.0)
+    out["Final Capped Weight"] = final.reindex(out.index).fillna(0.0)
+    return out.reset_index()
 
 def candidate_portfolios(returns: pd.DataFrame, max_weight: float = 1.0, n_samples: int = 600, seed: int = 42) -> Tuple[Dict[str, pd.Series], pd.DataFrame]:
     r = clean_returns(returns)

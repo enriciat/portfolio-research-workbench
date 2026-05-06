@@ -18,6 +18,7 @@ import os
 import re
 import ssl
 import statistics
+import shutil
 import struct
 import tempfile
 import threading
@@ -114,6 +115,7 @@ class DataStore:
     use_yahoo_fallback: bool = True
     allow_non_letf_proxy: bool = False
     testfolio_sim_jar: Optional[Path] = None
+    refresh_sim_cache: bool = False
     extended_price_csvs: Tuple[Path, ...] = ()
     testfolio_cookie: str = ""
     testfolio_token: str = ""
@@ -275,6 +277,7 @@ class DataStore:
     _best_short_by_root: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _ssl_context: Optional[ssl.SSLContext] = None
     _testfolio_sim_path: Optional[Path] = None
+    _testfolio_sim_cache_path: Optional[Path] = None
     _testfolio_sim_table: Optional[Dict[str, PriceSeries]] = None
     _external_csv_table: Optional[Dict[str, PriceSeries]] = None
     _testfolio_series_cache: Dict[str, Optional[PriceSeries]] = field(default_factory=dict)
@@ -294,6 +297,9 @@ class DataStore:
         self._best_long_by_root, self._best_short_by_root = self._build_best_letf_maps()
         self._ssl_context = self._build_ssl_context()
         self._testfolio_sim_path = self._resolve_testfolio_sim_jar(self.testfolio_sim_jar)
+        self._testfolio_sim_cache_path = (self.config_dir / "extended_prices" / "testfolio-sim.csv").resolve()
+        if self.refresh_sim_cache:
+            self._refresh_testfolio_sim_cache()
 
     def data_source_summary(self) -> Dict[str, Any]:
         def count_dat(subdir: str) -> int:
@@ -313,6 +319,8 @@ class DataStore:
             "prices_files": count_dat("prices"),
             "extended_price_csvs": [str(p) for p in self.extended_price_csvs],
             "network_calls": self._testfolio_call_count > 0,
+            "testfolio_sim_cache": str(self._testfolio_sim_cache_path) if self._testfolio_sim_cache_path else "",
+            "testfolio_sim_cache_exists": bool(self._testfolio_sim_cache_path and self._testfolio_sim_cache_path.exists()),
             "testfolio_sim_jar": str(self._testfolio_sim_path) if self._testfolio_sim_path else "",
             "testfolio_sim_series": len(self._testfolio_sim_table or {}),
             "testfolio_api_enabled": self.use_testfolio_api,
@@ -459,54 +467,110 @@ class DataStore:
             return None
         return max(existing, key=lambda p: p.stat().st_mtime)
 
+    def _read_wide_price_csv(self, path: Path) -> Dict[str, PriceSeries]:
+        out: Dict[str, PriceSeries] = {}
+        if not path.exists() or not path.is_file():
+            return out
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if not header or len(header) < 2:
+                    return out
+                symbols = [str(col or "").strip().upper() for col in header[1:]]
+                columns = {sym: [None] * len(self.market_days) for sym in symbols if sym}
+                for row in reader:
+                    if not row:
+                        continue
+                    raw_date = str(row[0] or "").strip()
+                    if not raw_date:
+                        continue
+                    try:
+                        idx = self.day_to_index[parse_date_iso(raw_date)]
+                    except Exception:
+                        continue
+                    for col_idx, sym in enumerate(symbols, start=1):
+                        if not sym or col_idx >= len(row):
+                            continue
+                        raw_val = str(row[col_idx] or "").strip()
+                        if not raw_val:
+                            continue
+                        try:
+                            px = float(raw_val)
+                        except Exception:
+                            continue
+                        if math.isfinite(px) and px > 0:
+                            columns[sym][idx] = px
+                out = {sym: PriceSeries(symbol=sym, values=vals) for sym, vals in columns.items()}
+        except Exception:
+            return {}
+        return out
+
+    def _refresh_testfolio_sim_cache(self) -> bool:
+        jar_path = self._testfolio_sim_path
+        cache_path = self._testfolio_sim_cache_path or (self.config_dir / "extended_prices" / "testfolio-sim.csv")
+        if jar_path is None or not jar_path.exists():
+            return False
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(jar_path) as zf:
+                with zf.open("Testfolio_SIM.csv") as src, cache_path.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            return True
+        except Exception:
+            return False
+
     def _load_testfolio_sim_table(self) -> Dict[str, PriceSeries]:
         if self._testfolio_sim_table is not None:
             return self._testfolio_sim_table
 
         out: Dict[str, PriceSeries] = {}
+        cache_path = self._testfolio_sim_cache_path or (self.config_dir / "extended_prices" / "testfolio-sim.csv")
+        # Prefer persistent cache; it removes fragile runtime jar dependency.
+        if cache_path.exists():
+            out = self._read_wide_price_csv(cache_path)
+            if out:
+                self._testfolio_sim_table = out
+                return out
+
         jar_path = self._testfolio_sim_path
-        if jar_path is None:
-            self._testfolio_sim_table = out
-            return out
-
-        try:
-            with zipfile.ZipFile(jar_path) as zf:
-                with zf.open("Testfolio_SIM.csv") as raw:
-                    text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
-                    reader = csv.reader(text)
-                    header = next(reader, None)
-                    if not header or len(header) < 2:
-                        self._testfolio_sim_table = out
-                        return out
-
-                    symbols = [str(col or "").strip().upper() for col in header[1:]]
-                    columns = {sym: [None] * len(self.market_days) for sym in symbols if sym}
-                    for row in reader:
-                        if not row:
-                            continue
-                        raw_date = str(row[0] or "").strip()
-                        if not raw_date:
-                            continue
-                        try:
-                            idx = self.day_to_index[parse_date_iso(raw_date)]
-                        except Exception:
-                            continue
-                        for col_idx, sym in enumerate(symbols, start=1):
-                            if not sym or col_idx >= len(row):
-                                continue
-                            raw_val = str(row[col_idx] or "").strip()
-                            if not raw_val:
-                                continue
-                            try:
-                                px = float(raw_val)
-                            except Exception:
-                                continue
-                            if not math.isfinite(px) or px <= 0:
-                                continue
-                            columns[sym][idx] = px
-                    out = {sym: PriceSeries(symbol=sym, values=vals) for sym, vals in columns.items()}
-        except Exception:
-            out = {}
+        if jar_path is not None:
+            try:
+                with zipfile.ZipFile(jar_path) as zf:
+                    with zf.open("Testfolio_SIM.csv") as raw:
+                        text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+                        reader = csv.reader(text)
+                        header = next(reader, None)
+                        if header and len(header) >= 2:
+                            symbols = [str(col or "").strip().upper() for col in header[1:]]
+                            columns = {sym: [None] * len(self.market_days) for sym in symbols if sym}
+                            for row in reader:
+                                if not row:
+                                    continue
+                                raw_date = str(row[0] or "").strip()
+                                if not raw_date:
+                                    continue
+                                try:
+                                    idx = self.day_to_index[parse_date_iso(raw_date)]
+                                except Exception:
+                                    continue
+                                for col_idx, sym in enumerate(symbols, start=1):
+                                    if not sym or col_idx >= len(row):
+                                        continue
+                                    raw_val = str(row[col_idx] or "").strip()
+                                    if not raw_val:
+                                        continue
+                                    try:
+                                        px = float(raw_val)
+                                    except Exception:
+                                        continue
+                                    if math.isfinite(px) and px > 0:
+                                        columns[sym][idx] = px
+                            out = {sym: PriceSeries(symbol=sym, values=vals) for sym, vals in columns.items()}
+                            if out and not cache_path.exists():
+                                self._refresh_testfolio_sim_cache()
+            except Exception:
+                out = {}
 
         self._testfolio_sim_table = out
         return out
@@ -578,10 +642,11 @@ class DataStore:
         table = self._load_external_csv_table()
         if not table:
             return None
-        series = table.get(symbol)
-        if series is None:
-            return None
-        return PriceSeries(symbol=symbol, values=series.values)
+        for candidate in self._testfolio_sim_candidates(symbol):
+            series = table.get(candidate)
+            if series is not None:
+                return PriceSeries(symbol=symbol, values=series.values)
+        return None
 
     def _merge_fill_missing(
         self,
@@ -1147,8 +1212,9 @@ class DataStore:
 
             direct = self._load_direct_symbol(symbol)
             merged = self._extend_with_letf_map(symbol, direct)
-            merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
+            # Prefer local extended-price/SIM cache before jar or network fallback.
             merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
+            merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
             merged = self._extend_with_stitch_map(symbol, merged)
             merged = self._extend_with_testfolio_api(symbol, merged)
             merged = self._merge_fill_missing(symbol, merged, self._fetch_yahoo_history(symbol))
@@ -3442,6 +3508,7 @@ def run_cli() -> int:
     p.add_argument("--no-yahoo-fallback", action="store_true", help="Disable Yahoo Finance fallback fetches")
     p.add_argument("--allow-non-letf-proxy", action="store_true", help="Allow heuristic/non-LetfMap proxy substitutions")
     p.add_argument("--testfolio-sim-jar", default="", help="Optional BacktestReport.jar path for local Testfolio_SIM.csv history")
+    p.add_argument("--refresh-sim-cache", action="store_true", help="Rebuild config/extended_prices/testfolio-sim.csv from BacktestReport.jar before running")
     p.add_argument("--extended-price-csv", action="append", default=[], help="Optional wide CSV with Date column and one symbol per column")
     p.add_argument("--testfolio-api-url", default="https://testfol.io/api/tactical", help="Testfolio tactical endpoint")
     p.add_argument("--testfolio-timeout", type=float, default=40.0, help="Testfolio API timeout in seconds")
@@ -3466,6 +3533,7 @@ def run_cli() -> int:
         use_yahoo_fallback=not args.no_yahoo_fallback,
         allow_non_letf_proxy=bool(args.allow_non_letf_proxy),
         testfolio_sim_jar=Path(args.testfolio_sim_jar).expanduser() if args.testfolio_sim_jar else None,
+        refresh_sim_cache=bool(args.refresh_sim_cache),
         extended_price_csvs=tuple(Path(p).expanduser() for p in (args.extended_price_csv or [])),
         testfolio_cookie=str(args.testfolio_cookie or os.environ.get("TESTFOLIO_COOKIE", "")),
         testfolio_token=str(args.testfolio_token or os.environ.get("TESTFOLIO_TOKEN", "")),

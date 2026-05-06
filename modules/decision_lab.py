@@ -303,32 +303,58 @@ def candidate_monte_carlo_comparison(
     return pd.DataFrame(rows).set_index("Portfolio") if rows else pd.DataFrame()
 
 
-def final_decision_table(metrics: pd.DataFrame, corr_req: pd.DataFrame, stress_curve: pd.DataFrame, mc_comp: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+
+
+def candidate_correlation_safety(returns: pd.DataFrame, candidates: Dict[str, pd.Series]) -> pd.Series:
+    """Compute candidate-specific mean Sharpe correlation safety on a 0..1 scale."""
+    vals = {}
+    for name, w in candidates.items():
+        req = marginal_correlation_requirements(returns, w)
+        if req.empty or "Sharpe Corr Safety" not in req:
+            vals[name] = 0.5
+            continue
+        mean_safety = float(req["Sharpe Corr Safety"].replace([np.inf, -np.inf], np.nan).mean())
+        vals[name] = max(0.0, min(1.0, 0.5 + mean_safety / 2.0)) if np.isfinite(mean_safety) else 0.5
+    return pd.Series(vals, name="Correlation Safety Backdrop")
+
+def final_decision_table(
+    metrics: pd.DataFrame,
+    corr_req: pd.DataFrame,
+    stress_curve: pd.DataFrame,
+    mc_comp: Optional[pd.DataFrame] = None,
+    corr_safety_by_candidate: Optional[pd.Series] = None,
+    conservativeness: float = 1.0,
+) -> pd.DataFrame:
     """Build a readable final-decision component table for current candidate metrics.
 
-    This is intentionally transparent: it uses percentile ranks and exposes each component.
+    Conservativeness scales downside, concentration, MC downside, and correlation
+    safety components relative to return/risk-adjusted-return components.
     """
     if metrics.empty:
         return pd.DataFrame()
     df = metrics.copy()
     def rank(s, high_good=True):
         return s.rank(pct=True, ascending=high_good).fillna(0.5)
+    conservativeness = float(max(0.25, min(2.50, conservativeness)))
     out = pd.DataFrame(index=df.index)
     out["Return Score"] = rank(df.get("CAGR", pd.Series(index=df.index, dtype=float)), True)
     out["Risk Score"] = (rank(df.get("Max Drawdown", pd.Series(index=df.index, dtype=float)), True) + rank(df.get("cVaR 95", pd.Series(index=df.index, dtype=float)), True)) / 2
     out["Risk-Adjusted Score"] = (rank(df.get("Sharpe", pd.Series(index=df.index, dtype=float)), True) + rank(df.get("Calmar", pd.Series(index=df.index, dtype=float)), True)) / 2
-    # Higher HHI means more concentration, so the penalty must be larger for
-    # higher HHI.  The previous descending rank inverted this penalty.
     out["Concentration Penalty"] = rank(df.get("Concentration HHI", pd.Series(index=df.index, dtype=float)), True) * 0.35 if "Concentration HHI" in df else 0.0
     if mc_comp is not None and not mc_comp.empty:
         mc = mc_comp.reindex(out.index)
         out["MC Downside Score"] = (rank(mc.get("5% CAGR", pd.Series(index=out.index, dtype=float)), True) + rank(mc.get("5% Max DD", pd.Series(index=out.index, dtype=float)), True)) / 2
     else:
         out["MC Downside Score"] = 0.5
-    # Active correlation requirements are strategy-level not candidate-level; apply mean safety as global backdrop.
-    mean_safety = float(corr_req["Sharpe Corr Safety"].mean()) if corr_req is not None and not corr_req.empty and "Sharpe Corr Safety" in corr_req else 0.0
-    out["Correlation Safety Backdrop"] = max(0.0, min(1.0, 0.5 + mean_safety / 2.0))
-    out["Final Score"] = 1.1*out["Return Score"] + 1.25*out["Risk Score"] + 1.1*out["Risk-Adjusted Score"] + 1.0*out["MC Downside Score"] + 0.7*out["Correlation Safety Backdrop"] - out["Concentration Penalty"]
+    if corr_safety_by_candidate is not None and len(corr_safety_by_candidate):
+        out["Correlation Safety Backdrop"] = corr_safety_by_candidate.reindex(out.index).fillna(0.5).clip(0.0, 1.0)
+    else:
+        mean_safety = float(corr_req["Sharpe Corr Safety"].mean()) if corr_req is not None and not corr_req.empty and "Sharpe Corr Safety" in corr_req else 0.0
+        out["Correlation Safety Backdrop"] = max(0.0, min(1.0, 0.5 + mean_safety / 2.0))
+    growth = 1.1*out["Return Score"] + 1.1*out["Risk-Adjusted Score"]
+    defense = 1.25*out["Risk Score"] + 1.0*out["MC Downside Score"] + 0.7*out["Correlation Safety Backdrop"] - out["Concentration Penalty"]
+    out["Conservativeness"] = conservativeness
+    out["Final Score"] = growth + conservativeness * defense
     out["Decision"] = pd.cut(out["Final Score"], [-np.inf, out["Final Score"].quantile(.4), out["Final Score"].quantile(.75), np.inf], labels=["Reject / research only", "Viable", "Recommended shortlist"])
     return out.sort_values("Final Score", ascending=False)
 

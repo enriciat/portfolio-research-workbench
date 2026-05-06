@@ -237,6 +237,7 @@ def run_engine_task(
     retries: int,
     cookie: str,
     token: str,
+    refresh_sim_cache: bool = False,
 ) -> Tuple[BacktestTask, int, str, str, float, str]:
     task_dir.mkdir(parents=True, exist_ok=True)
     input_path = task_dir / task.input_file_name
@@ -270,6 +271,8 @@ def run_engine_task(
         cmd.append("--no-yahoo-fallback")
     if allow_non_letf_proxy:
         cmd.append("--allow-non-letf-proxy")
+    if refresh_sim_cache:
+        cmd.append("--refresh-sim-cache")
 
     env = os.environ.copy()
     env.setdefault("MPLBACKEND", "Agg")
@@ -347,6 +350,7 @@ def run_backtest_batch(
     retries: int,
     cookie: str,
     token: str,
+    refresh_sim_cache: bool,
     parallel_strategy_level: bool,
     max_workers: int,
     selected_strategy_keys: Optional[List[str]] = None,
@@ -398,7 +402,7 @@ def run_backtest_batch(
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = []
             for task in tasks:
-                futures.append(ex.submit(run_engine_task, task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token))
+                futures.append(ex.submit(run_engine_task, task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token, refresh_sim_cache))
             for fut in as_completed(futures):
                 try:
                     process_tuple(fut.result())
@@ -408,7 +412,7 @@ def run_backtest_batch(
                     completed += 1
     else:
         for task in tasks:
-            process_tuple(run_engine_task(task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token))
+            process_tuple(run_engine_task(task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token, refresh_sim_cache))
 
     index = build_index_from_outputs(merged_out)
     files_before = collect_output_files(merged_out)
@@ -681,8 +685,10 @@ def render_visual_metric_companions(summary: pd.DataFrame) -> None:
     df = summary.reset_index()
     c1, c2 = st.columns(2)
     with c1:
-        if "CAGR" in df.columns and "Max Drawdown" in df.columns:
-            st.plotly_chart(px.scatter(df, x="Max Drawdown", y="CAGR", size="Volatility", hover_name="Strategy", title="Risk/return map"), use_container_width=True)
+        x_axis = risk_return_x_axis("performance_risk_return_x")
+        if "CAGR" in df.columns and x_axis in df.columns:
+            size_col = "Volatility" if x_axis != "Volatility" and "Volatility" in df.columns else ("Max Drawdown" if "Max Drawdown" in df.columns else None)
+            st.plotly_chart(px.scatter(df, x=x_axis, y="CAGR", size=size_col, hover_name="Strategy", title=f"Risk/return map: CAGR vs {x_axis}"), use_container_width=True)
     with c2:
         if "Sharpe" in df.columns:
             st.plotly_chart(px.bar(df.sort_values("Sharpe", ascending=False), x="Strategy", y="Sharpe", title="Sharpe ranking"), use_container_width=True)
@@ -734,6 +740,36 @@ def display_readable_table(df: pd.DataFrame, *args, **kwargs) -> None:
         st.info("No table data available.")
         return
     st.dataframe(readable_styler(df), *args, **kwargs)
+
+
+def risk_return_x_axis(key: str = "risk_return_x_axis") -> str:
+    return st.selectbox("Risk/return X-axis", ["Max Drawdown", "Volatility", "cVaR 95"], index=0, key=key)
+
+
+def correlation_with_mean_column(corr: pd.DataFrame) -> pd.DataFrame:
+    """Old correlation-tool style matrix: append per-strategy mean correlation."""
+    if corr is None or corr.empty:
+        return corr
+    out = corr.copy()
+    base_cols = list(out.columns)
+    if out.shape[0] > 1 and set(out.index) == set(base_cols):
+        means = []
+        for idx in out.index:
+            vals = pd.to_numeric(out.loc[idx, base_cols], errors="coerce").drop(labels=[idx], errors="ignore")
+            means.append(float(vals.mean()) if len(vals) else np.nan)
+        out["Mean"] = means
+    return out
+
+
+def mean_correlation_table(corr: pd.DataFrame, label: str = "Mean Corr") -> pd.DataFrame:
+    if corr is None or corr.empty or corr.shape[0] < 2:
+        return pd.DataFrame()
+    cols = list(corr.columns)
+    rows = []
+    for idx in corr.index:
+        vals = pd.to_numeric(corr.loc[idx, cols], errors="coerce").drop(labels=[idx], errors="ignore")
+        rows.append({"Strategy": idx, label: float(vals.mean()) if len(vals) else np.nan})
+    return pd.DataFrame(rows).sort_values(label)
 
 
 UNIVERSE_MODES = [
@@ -942,15 +978,34 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
         )
         st.caption(f"Optimization observations: {len(opt_returns)} | Validation observations: {len(val_returns)} | Reporting observations: {len(base_returns)}")
 
+        usage = pd.DataFrame([
+            {"Method": "Equal Weight", "Correlation Use": "Weak / not direct", "Notes": "Naive diversification benchmark."},
+            {"Method": "Inverse Volatility", "Correlation Use": "Weak / not direct", "Notes": "Uses standalone volatility, not pairwise co-movement."},
+            {"Method": "Inverse Drawdown", "Correlation Use": "Weak / not direct", "Notes": "Uses standalone max drawdown."},
+            {"Method": "Minimum Variance", "Correlation Use": "Direct", "Notes": "Uses covariance matrix."},
+            {"Method": "Max Diversification", "Correlation Use": "Direct", "Notes": "Uses volatility and covariance structure."},
+            {"Method": "Max Sharpe", "Correlation Use": "Direct", "Notes": "Optimizes portfolio-level Sharpe, so covariance matters."},
+            {"Method": "Max Sortino / Max Calmar / Min cVaR", "Correlation Use": "Implicit", "Notes": "Tests combined return streams; co-crashes hurt the objective."},
+            {"Method": "Robust Recommended", "Correlation Use": "Implicit + penalty", "Notes": "Uses combined portfolio metrics plus concentration/tail-correlation penalties."},
+        ])
+        with st.expander("How each optimizer uses correlation", expanded=False):
+            display_readable_table(usage, use_container_width=True, hide_index=True)
+
     with st.expander("Per-strategy constraints", expanded=False):
-        st.caption("Exclude strategies or cap their maximum weight. Caps are applied after every optimizer and before evaluation.")
+        st.caption("Exclude strategies or cap their maximum weight. Caps are applied after every optimizer and before evaluation. Settings persist while you switch pages.")
         constraint_rows = []
         for col in base_returns.columns:
+            ex_key = f"portfolio_constraint_exclude::{col}"
+            cap_key = f"portfolio_constraint_cap::{col}"
+            if ex_key not in st.session_state:
+                st.session_state[ex_key] = False
+            if cap_key not in st.session_state:
+                st.session_state[cap_key] = float(max_weight)
             cc1, cc2, cc3 = st.columns([3, 1, 1])
             cc1.write(col)
-            excluded = cc2.checkbox("Exclude", value=False, key=f"exclude_{col}")
-            cap = cc3.slider("Max", 0.0, 1.0, float(max_weight), 0.05, key=f"cap_{col}")
-            constraint_rows.append({"Strategy": col, "Exclude": excluded, "Max Weight": cap})
+            excluded = cc2.checkbox("Exclude", key=ex_key)
+            cap = cc3.slider("Max", 0.0, 1.0, 0.05, key=cap_key)
+            constraint_rows.append({"Strategy": col, "Exclude": bool(excluded), "Max Weight": float(cap)})
         constraints_df = pd.DataFrame(constraint_rows)
     allowed_cols = constraints_df.loc[~constraints_df["Exclude"], "Strategy"].tolist()
     if not allowed_cols:
@@ -1002,7 +1057,10 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
             st.subheader("Validation-universe candidate performance")
             display_readable_table(val_metrics, use_container_width=True)
             vdf = val_metrics.reset_index()
-            st.plotly_chart(px.scatter(vdf, x="Max Drawdown", y="CAGR", size="Volatility", hover_name="Portfolio", title="Validation-universe risk/return map"), use_container_width=True)
+            x_axis = risk_return_x_axis("validation_risk_return_x")
+            if x_axis in vdf.columns:
+                size_col = "Volatility" if x_axis != "Volatility" else ("Max Drawdown" if "Max Drawdown" in vdf.columns else None)
+                st.plotly_chart(px.scatter(vdf, x=x_axis, y="CAGR", size=size_col, hover_name="Portfolio", title=f"Validation-universe risk/return map: CAGR vs {x_axis}"), use_container_width=True)
 
     st.subheader("Candidate portfolio decision table")
     num_cols = decision.select_dtypes("number").columns
@@ -1010,11 +1068,30 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
     # Visual companions for the table.
     dfp = decision.reset_index()
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.scatter(dfp, x="Max Drawdown", y="CAGR", size="Volatility", color="Classification", hover_name="Portfolio", title="Candidate risk/return map"), use_container_width=True)
+    x_axis = risk_return_x_axis("candidate_risk_return_x")
+    if x_axis in dfp.columns:
+        size_col = "Volatility" if x_axis != "Volatility" else ("Max Drawdown" if "Max Drawdown" in dfp.columns else None)
+        c1.plotly_chart(px.scatter(dfp, x=x_axis, y="CAGR", size=size_col, color="Classification", hover_name="Portfolio", title=f"Candidate risk/return map: CAGR vs {x_axis}"), use_container_width=True)
     c2.plotly_chart(px.bar(dfp.sort_values("Decision Score", ascending=False), x="Portfolio", y="Decision Score", color="Classification", title="Decision-score ranking"), use_container_width=True)
     c3, c4 = st.columns(2)
     c3.plotly_chart(px.bar(dfp.sort_values("cVaR 95"), x="Portfolio", y="cVaR 95", title="Candidate left-tail cVaR ranking"), use_container_width=True)
     c4.plotly_chart(px.bar(dfp.sort_values("Max Drawdown"), x="Portfolio", y="Max Drawdown", title="Candidate max-drawdown ranking"), use_container_width=True)
+
+    st.subheader("Candidate weights overview")
+    weights_wide = pd.DataFrame({name: w.reindex(allowed_cols).fillna(0.0) for name, w in candidates.items()}).T
+    st.plotly_chart(px.imshow(weights_wide, text_auto=".1%", color_continuous_scale="Blues", aspect="auto", title="Candidate weight heatmap"), use_container_width=True)
+    weights_long = weights_wide.reset_index().rename(columns={"index": "Portfolio"}).melt(id_vars="Portfolio", var_name="Strategy", value_name="Weight")
+    st.plotly_chart(px.bar(weights_long, x="Portfolio", y="Weight", color="Strategy", title="Candidate weights stacked bar", barmode="stack"), use_container_width=True)
+
+    with st.expander("Inverse-risk diagnostics", expanded=False):
+        st.caption("Shows raw risk inputs, inverse-risk scores, uncapped normalized weights, and final capped weights. Useful when inverse-volatility or tail-risk parity appears close to equal weight.")
+        d1, d2 = st.columns(2)
+        inv_diag = pl.inverse_risk_diagnostics(opt_returns, "inverse_volatility", max_weight=float(max_weight))
+        tail_diag = pl.inverse_risk_diagnostics(opt_returns, "tail_risk_parity", max_weight=float(max_weight))
+        d1.subheader("Inverse Volatility")
+        d1.dataframe(readable_styler(inv_diag), use_container_width=True, hide_index=True)
+        d2.subheader("Tail Risk Parity")
+        d2.dataframe(readable_styler(tail_diag), use_container_width=True, hide_index=True)
 
     selected_port = st.selectbox("Select active portfolio to analyze everywhere else", list(decision.index), index=0)
     st.session_state["active_portfolio_name"] = selected_port
@@ -1062,9 +1139,20 @@ def render_correlation_stress_lab(base_returns: pd.DataFrame, returns_with_compo
     sim_threshold = c4.slider("Similarity warning threshold", 0.70, 0.99, 0.90, 0.01)
     corr = ap.correlation_matrix(returns_with_composite, method=method)
     tail_corr, n_tail = ap.tail_correlation(returns_with_composite, trigger=trigger, threshold=tail_threshold)
+    corr_view = correlation_with_mean_column(corr)
+    tail_corr_view = correlation_with_mean_column(tail_corr)
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title="Normal correlation matrix"), use_container_width=True)
-    c2.plotly_chart(px.imshow(tail_corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title=f"Tail correlation matrix ({n_tail} obs)"), use_container_width=True)
+    c1.plotly_chart(px.imshow(corr_view, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title="Normal correlation matrix + Mean"), use_container_width=True)
+    c2.plotly_chart(px.imshow(tail_corr_view, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title=f"Tail correlation matrix + Mean ({n_tail} obs)"), use_container_width=True)
+    m1, m2 = st.columns(2)
+    mt = mean_correlation_table(corr, "Mean Corr")
+    tt = mean_correlation_table(tail_corr, "Mean Tail Corr")
+    if not mt.empty:
+        m1.subheader("Mean correlation by strategy")
+        m1.dataframe(readable_styler(mt), use_container_width=True, hide_index=True)
+    if not tt.empty:
+        m2.subheader("Mean tail correlation by strategy")
+        m2.dataframe(readable_styler(tt), use_container_width=True, hide_index=True)
     sim = ap.similarity_pairs(base_returns, threshold=sim_threshold)
     if not sim.empty:
         st.warning("Potential strategy redundancy detected. These pairs may not provide true diversification.")
@@ -1091,7 +1179,7 @@ def render_correlation_stress_lab(base_returns: pd.DataFrame, returns_with_compo
         stress_table = pd.DataFrame([normal, stressed], index=["Base composite", "Synthetic stress composite"])
         st.dataframe(stress_table.style.format({c: "{:.4f}" for c in stress_table.select_dtypes("number").columns}), use_container_width=True)
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.imshow(stress["stress_corr"], text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Stressed correlation matrix"), use_container_width=True)
+        c1.plotly_chart(px.imshow(correlation_with_mean_column(stress["stress_corr"]), text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Stressed correlation matrix + Mean"), use_container_width=True)
         comparison = pd.DataFrame({"Base": stress["base_series"], "Synthetic stress": stress["stress_series"]})
         c2.plotly_chart(px.line((1 + comparison).cumprod(), title="Base vs synthetic stress equity", log_y=True), use_container_width=True)
         mdf = stress_table.reset_index().rename(columns={"index": "Scenario"})
@@ -1309,11 +1397,12 @@ def render_portfolio_decision_page(base_returns: pd.DataFrame, weights: pd.Serie
     st.caption("Transparent decision engine combining historical metrics, correlation safety, stress robustness, and Monte Carlo downside. It is not a black box: all components are shown.")
     mc_returns = _safe_universe(mc_returns, base_returns)
     candidates = _candidate_dict_from_state(base_returns)
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     n_sims = c1.slider("MC sims per candidate", 100, 2500, 400, 100, key="decision_mc_sims")
     horizon = c2.slider("MC horizon years", 1, 20, 5, 1, key="decision_mc_horizon")
     block = c3.slider("MC block length", 1, 52, 8, 1, key="decision_mc_block")
     dd_limit = c4.slider("DD breach threshold", -0.80, -0.05, -0.30, 0.05, key="decision_dd")
+    conservativeness = c5.slider("Conservativeness", 0.25, 2.50, 1.00, 0.05, key="decision_conservativeness", help="Higher values give more weight to risk, MC downside, concentration, and correlation safety relative to return.")
     metrics_rows = []
     for name, w in candidates.items():
         m = pl.portfolio_metrics(base_returns, w, name)
@@ -1335,7 +1424,8 @@ def render_portfolio_decision_page(base_returns: pd.DataFrame, weights: pd.Serie
     breakpoints = st.session_state.get("last_corr_breakpoints")
     if breakpoints is None or not isinstance(breakpoints, pd.DataFrame) or breakpoints.empty:
         breakpoints = dl.correlation_breakpoint_curve(base_returns, weights)
-    decision = dl.final_decision_table(metrics, corr_req, breakpoints, mc if not mc.empty else None)
+    corr_safety = dl.candidate_correlation_safety(base_returns, candidates)
+    decision = dl.final_decision_table(metrics, corr_req, breakpoints, mc if not mc.empty else None, corr_safety_by_candidate=corr_safety, conservativeness=float(conservativeness))
     st.session_state["last_decision_table"] = decision
     st.subheader("Final decision table")
     display_readable_table(decision, use_container_width=True)
@@ -1766,6 +1856,7 @@ def main() -> None:
         chart_benchmark = st.text_input("Extra chart benchmark", value="QQQ", help="Shown only in cumulative return chart.")
         strict = st.checkbox("Strict mode", value=False, help="Fail if the compiler emits warnings.")
         allow_non_letf_proxy = st.checkbox("Allow non-LetfMap heuristic proxies", value=False)
+        refresh_sim_cache = st.checkbox("Refresh local Testfolio SIM cache from BacktestReport.jar", value=False, help="Only needed when a local BacktestReport.jar is available and you want to rebuild config/extended_prices/testfolio-sim.csv.")
         st.divider()
         st.subheader("Parallel execution")
         parallel_strategy_level = st.checkbox("Parallelize individual strategies", value=True)
@@ -1856,7 +1947,7 @@ def main() -> None:
             with st.status("Running backtest engine…", expanded=True) as status:
                 progress = st.progress(0.0, text="Starting backtest tasks…")
                 try:
-                    run = run_backtest_batch(uploaded_payloads, benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, int(timeout_sec), int(retries), cookie, token, parallel_strategy_level, int(max_workers), selected_strategy_keys=selected_keys if selected_keys else None, progress_placeholder=progress)
+                    run = run_backtest_batch(uploaded_payloads, benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, int(timeout_sec), int(retries), cookie, token, bool(refresh_sim_cache), parallel_strategy_level, int(max_workers), selected_strategy_keys=selected_keys if selected_keys else None, progress_placeholder=progress)
                     st.session_state["last_run"] = run
                     status.update(label="Backtest batch complete" if run.returncode == 0 else "Backtest batch finished with warnings/errors", state="complete" if run.returncode == 0 else "error")
                 except Exception as exc:
