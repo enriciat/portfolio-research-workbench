@@ -918,26 +918,149 @@ def _candidate_weights_to_df(candidates: Dict[str, pd.Series]) -> pd.DataFrame:
             rows.append({"Portfolio": port, "Strategy": strat, "Weight": float(val)})
     return pd.DataFrame(rows)
 
-def _apply_weight_caps(weights: pd.Series, caps: Dict[str, float]) -> pd.Series:
-    """Clip weights to per-strategy caps and redistribute leftover to uncapped names."""
-    w = weights.astype(float).copy().fillna(0.0).clip(lower=0.0)
-    if w.sum() <= 0:
-        return pl.normalize_weights(w, list(w.index))
-    w = w / w.sum()
-    caps_s = pd.Series({k: float(v) for k, v in caps.items()}, index=w.index).fillna(1.0).clip(lower=0.0, upper=1.0)
-    for _ in range(100):
-        over = w > caps_s + 1e-12
+def _constraint_type_from_saved(saved_row: Dict[str, Any], default_global_max: float) -> str:
+    """Map old/new persisted constraint records to the current override mode."""
+    mode = str(saved_row.get("Constraint Type") or saved_row.get("Override") or "No override")
+    valid = {"No override", "Minimum allocation", "Maximum allocation", "Fixed allocation"}
+    if mode in valid:
+        return mode
+    # Older app versions only stored Max Weight. Treat a genuinely custom cap as
+    # a maximum override, but do not convert the old default global cap into a
+    # per-strategy override.
+    if "Max Weight" in saved_row:
+        try:
+            old_cap = float(saved_row.get("Max Weight", default_global_max))
+            if abs(old_cap - float(default_global_max)) > 1e-9:
+                return "Maximum allocation"
+        except Exception:
+            pass
+    return "No override"
+
+
+def _portfolio_constraint_warnings(constraints_df: pd.DataFrame, global_max: float) -> list[str]:
+    """Return feasibility warnings for per-strategy allocation overrides."""
+    if constraints_df.empty:
+        return []
+    active = constraints_df[~constraints_df["Exclude"]].copy()
+    if active.empty:
+        return ["All strategies are excluded."]
+    active["Allocation"] = pd.to_numeric(active["Allocation"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    fixed_sum = float(active.loc[active["Constraint Type"] == "Fixed allocation", "Allocation"].sum())
+    min_sum = float(active.loc[active["Constraint Type"] == "Minimum allocation", "Allocation"].sum())
+    warnings = []
+    if fixed_sum > 1.0 + 1e-9:
+        warnings.append(f"Fixed allocations sum to {fixed_sum:.1%}, above 100%; they will be scaled down.")
+    if fixed_sum + min_sum > 1.0 + 1e-9:
+        warnings.append(f"Fixed + minimum allocations sum to {fixed_sum + min_sum:.1%}, above 100%; minimums will be scaled to fit.")
+    max_capacity = 0.0
+    for _, row in active.iterrows():
+        mode = row.get("Constraint Type", "No override")
+        val = float(row.get("Allocation", 0.0))
+        if mode == "Fixed allocation":
+            max_capacity += val
+        elif mode == "Maximum allocation":
+            max_capacity += val
+        elif mode == "Minimum allocation":
+            max_capacity += 1.0
+        else:
+            max_capacity += float(global_max)
+    if max_capacity < 1.0 - 1e-9:
+        warnings.append(f"Maximum-capacity constraints sum to only {max_capacity:.1%}; caps must be relaxed to invest 100%.")
+    return warnings
+
+
+def _apply_allocation_overrides(weights: pd.Series, constraints_df: pd.DataFrame, global_max: float) -> pd.Series:
+    """Apply per-strategy allocation overrides after an optimizer proposes weights.
+
+    Priority order is: Exclude -> Fixed -> Minimum/Maximum -> global max.
+    Per-strategy override modes deliberately take precedence over the global max
+    weight setting.  This lets a user force, for example, Anemoi to be at least
+    20% or cap Nyx at 10% even if the global optimizer settings differ.
+    """
+    if constraints_df is None or constraints_df.empty:
+        return pl.normalize_weights(weights, list(weights.index), max_weight=float(global_max))
+
+    active = constraints_df[~constraints_df["Exclude"]].copy()
+    cols = [str(x) for x in active["Strategy"].tolist() if str(x) in weights.index]
+    if not cols:
+        return pd.Series(dtype=float)
+
+    raw = weights.reindex(cols).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+    raw = raw / raw.sum() if raw.sum() > 0 else pd.Series(1.0 / len(cols), index=cols)
+
+    mode = active.set_index("Strategy")["Constraint Type"].reindex(cols).fillna("No override")
+    alloc = pd.to_numeric(active.set_index("Strategy")["Allocation"].reindex(cols), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+
+    final = pd.Series(0.0, index=cols, dtype=float)
+
+    fixed_idx = mode[mode == "Fixed allocation"].index
+    if len(fixed_idx):
+        fixed_vals = alloc.loc[fixed_idx].copy()
+        if fixed_vals.sum() > 1.0:
+            fixed_vals = fixed_vals / fixed_vals.sum()
+        final.loc[fixed_idx] = fixed_vals
+
+    remaining_after_fixed = max(0.0, 1.0 - float(final.sum()))
+    non_fixed = [c for c in cols if c not in fixed_idx]
+
+    # Reserve minimum allocations first. If minimums are infeasible, scale them
+    # proportionally rather than silently breaking the portfolio.
+    min_idx = [c for c in non_fixed if mode.loc[c] == "Minimum allocation"]
+    if min_idx and remaining_after_fixed > 0:
+        min_vals = alloc.loc[min_idx].copy()
+        if min_vals.sum() > remaining_after_fixed:
+            min_vals = min_vals / min_vals.sum() * remaining_after_fixed
+        final.loc[min_idx] = min_vals
+
+    remaining = max(0.0, 1.0 - float(final.sum()))
+    eligible = [c for c in non_fixed if remaining > 1e-12]
+    if not eligible:
+        return final / final.sum() if final.sum() > 0 else pd.Series(1.0 / len(cols), index=cols)
+
+    # Capacity determines how much additional weight each non-fixed strategy can
+    # receive. Max overrides define an explicit cap. No-override names use the
+    # global max. Minimum overrides are lower-bound only and may exceed global max.
+    capacity = pd.Series(0.0, index=eligible, dtype=float)
+    for c in eligible:
+        if mode.loc[c] == "Maximum allocation":
+            cap = float(alloc.loc[c])
+        elif mode.loc[c] == "Minimum allocation":
+            cap = 1.0
+        else:
+            cap = float(global_max)
+        capacity.loc[c] = max(0.0, cap - final.loc[c])
+
+    scores = raw.reindex(eligible).fillna(0.0)
+    for _ in range(len(eligible) + 3):
+        open_idx = capacity[capacity > 1e-12].index
+        if remaining <= 1e-12 or len(open_idx) == 0:
+            break
+        if capacity.loc[open_idx].sum() < remaining - 1e-12:
+            # Infeasible caps: fill all capacity, then relax constraints below.
+            final.loc[open_idx] += capacity.loc[open_idx]
+            remaining = 1.0 - final.sum()
+            break
+        sc = scores.loc[open_idx]
+        proposed = (sc / sc.sum() * remaining) if sc.sum() > 0 else pd.Series(remaining / len(open_idx), index=open_idx)
+        over = proposed > capacity.loc[open_idx] + 1e-12
         if not over.any():
+            final.loc[open_idx] += proposed
+            remaining = 0.0
             break
-        fixed = w[over].clip(upper=caps_s[over])
-        remainder = 1.0 - fixed.sum()
-        rest = w[~over]
-        if remainder <= 0 or rest.empty or rest.sum() <= 0:
-            w = pd.concat([fixed, pd.Series(0.0, index=rest.index)]).reindex(w.index).fillna(0.0)
-            break
-        rest = rest / rest.sum() * remainder
-        w = pd.concat([fixed, rest]).reindex(w.index).fillna(0.0)
-    return pl.normalize_weights(w, list(w.index))
+        over_idx = proposed[over].index
+        final.loc[over_idx] += capacity.loc[over_idx]
+        remaining = 1.0 - final.sum()
+        capacity.loc[over_idx] = 0.0
+
+    if final.sum() <= 0:
+        return pd.Series(1.0 / len(cols), index=cols)
+    if final.sum() < 1.0 - 1e-9:
+        # Last-resort infeasible-constraint relaxation: invest the remainder using
+        # the optimizer's proposed weights. This can only happen when caps are
+        # mutually impossible, and the UI emits a warning for that case.
+        add = raw / raw.sum() * (1.0 - final.sum()) if raw.sum() > 0 else pd.Series((1.0 - final.sum()) / len(cols), index=cols)
+        final = final.add(add, fill_value=0.0)
+    return final / final.sum()
 
 
 def _get_active_weights(base_returns: pd.DataFrame) -> pd.Series:
@@ -955,6 +1078,22 @@ def _add_active_composite(base_returns: pd.DataFrame, name: str = "Composite Por
     return out, weights
 
 
+def _portfolio_lab_saved_settings() -> Dict[str, Any]:
+    settings = st.session_state.get("portfolio_lab_settings")
+    return settings.copy() if isinstance(settings, dict) else {}
+
+
+def _saved_constraint_map() -> Dict[str, Dict[str, Any]]:
+    records = st.session_state.get("portfolio_constraints")
+    if not isinstance(records, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("Strategy") is not None:
+            out[str(rec["Strategy"])] = rec
+    return out
+
+
 def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.DataFrame] = None, validation_universe: Optional[pd.DataFrame] = None, universe_labels: Optional[Dict[str, str]] = None) -> Tuple[pd.DataFrame, pd.Series]:
     st.header("Portfolio Lab")
     st.caption("Build candidate portfolios from the generated strategy return streams. This page is meant to answer: which strategy mix is best to actually run?")
@@ -965,12 +1104,28 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
     opt_returns = _safe_universe(opt_universe, base_returns)
     val_returns = _safe_universe(validation_universe, base_returns)
     universe_labels = universe_labels or {}
+    saved_settings = _portfolio_lab_saved_settings()
+    if "portfolio_max_weight_widget" not in st.session_state:
+        st.session_state["portfolio_max_weight_widget"] = float(saved_settings.get("max_weight", 0.50))
+    if "portfolio_n_samples_widget" not in st.session_state:
+        st.session_state["portfolio_n_samples_widget"] = int(saved_settings.get("n_samples", 600))
+    if "portfolio_seed_widget" not in st.session_state:
+        st.session_state["portfolio_seed_widget"] = int(saved_settings.get("seed", 42))
+    if "portfolio_include_manual_widget" not in st.session_state:
+        st.session_state["portfolio_include_manual_widget"] = bool(saved_settings.get("include_manual", True))
+
     with st.expander("Portfolio construction controls", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
-        max_weight = c1.slider("Max weight per strategy", 0.10, 1.00, 0.50, 0.05)
-        n_samples = c2.slider("Random-search samples", 100, 3000, 600, 100)
-        seed = c3.number_input("Optimizer seed", min_value=1, max_value=999999, value=42, step=1)
-        include_manual = c4.checkbox("Create manual portfolio", value=True)
+        max_weight = c1.slider("Max weight per strategy", 0.10, 1.00, 0.50, 0.05, key="portfolio_max_weight_widget")
+        n_samples = c2.slider("Random-search samples", 100, 3000, 600, 100, key="portfolio_n_samples_widget")
+        seed = c3.number_input("Optimizer seed", min_value=1, max_value=999999, value=42, step=1, key="portfolio_seed_widget")
+        include_manual = c4.checkbox("Create manual portfolio", value=True, key="portfolio_include_manual_widget")
+        st.session_state["portfolio_lab_settings"] = {
+            "max_weight": float(max_weight),
+            "n_samples": int(n_samples),
+            "seed": int(seed),
+            "include_manual": bool(include_manual),
+        }
         st.info(
             f"Weights are optimized on **{universe_labels.get('optimization', 'selected optimization universe')}** "
             f"and evaluated on **{universe_labels.get('validation', 'selected validation universe')}**. "
@@ -991,42 +1146,83 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
         with st.expander("How each optimizer uses correlation", expanded=False):
             display_readable_table(usage, use_container_width=True, hide_index=True)
 
+    saved_constraints = _saved_constraint_map()
     with st.expander("Per-strategy constraints", expanded=False):
-        st.caption("Exclude strategies or cap their maximum weight. Caps are applied after every optimizer and before evaluation. Settings persist while you switch pages.")
+        st.caption(
+            "Exclude strategies, or set a per-strategy allocation override. "
+            "Override modes take priority over the global max-weight setting and are applied after every optimizer."
+        )
         constraint_rows = []
+        override_options = ["No override", "Minimum allocation", "Maximum allocation", "Fixed allocation"]
         for col in base_returns.columns:
             ex_key = f"portfolio_constraint_exclude::{col}"
-            cap_key = f"portfolio_constraint_cap::{col}"
+            mode_key = f"portfolio_constraint_mode::{col}"
+            alloc_key = f"portfolio_constraint_allocation::{col}"
+            saved_row = saved_constraints.get(col, {})
+            default_mode = _constraint_type_from_saved(saved_row, float(max_weight))
+            default_alloc = float(saved_row.get("Allocation", saved_row.get("Max Weight", max_weight)))
             if ex_key not in st.session_state:
-                st.session_state[ex_key] = False
-            if cap_key not in st.session_state:
-                st.session_state[cap_key] = float(max_weight)
-            cc1, cc2, cc3 = st.columns([3, 1, 1])
+                st.session_state[ex_key] = bool(saved_row.get("Exclude", False))
+            if mode_key not in st.session_state:
+                st.session_state[mode_key] = default_mode if default_mode in override_options else "No override"
+            if alloc_key not in st.session_state:
+                st.session_state[alloc_key] = float(np.clip(default_alloc, 0.0, 1.0))
+            cc1, cc2, cc3, cc4 = st.columns([3, 1, 2, 2])
             cc1.write(col)
             excluded = cc2.checkbox("Exclude", key=ex_key)
-            cap = cc3.slider("Max", 0.0, 1.0, 0.05, key=cap_key)
-            constraint_rows.append({"Strategy": col, "Exclude": bool(excluded), "Max Weight": float(cap)})
+            mode = cc3.selectbox("Override", override_options, key=mode_key)
+            allocation = cc4.slider("Allocation", 0.0, 1.0, 0.01, key=alloc_key, help="Used only when Override is Minimum, Maximum, or Fixed allocation.")
+            constraint_rows.append({
+                "Strategy": col,
+                "Exclude": bool(excluded),
+                "Constraint Type": str(mode),
+                "Allocation": float(allocation),
+                "Max Weight": float(allocation) if mode == "Maximum allocation" else float(max_weight),
+            })
         constraints_df = pd.DataFrame(constraint_rows)
+        warnings = _portfolio_constraint_warnings(constraints_df, float(max_weight))
+        for msg in warnings:
+            st.warning(msg)
+        preview = constraints_df.copy()
+        preview["Effective Rule"] = preview.apply(
+            lambda r: "Excluded" if r["Exclude"] else (
+                f"Min {r['Allocation']:.1%}" if r["Constraint Type"] == "Minimum allocation" else
+                f"Max {r['Allocation']:.1%}" if r["Constraint Type"] == "Maximum allocation" else
+                f"Fixed {r['Allocation']:.1%}" if r["Constraint Type"] == "Fixed allocation" else
+                f"Global max {float(max_weight):.1%}"
+            ),
+            axis=1,
+        )
+        display_readable_table(preview[["Strategy", "Exclude", "Constraint Type", "Allocation", "Effective Rule"]], use_container_width=True, hide_index=True)
+    # Save immediately to a durable non-widget state object. Streamlit deletes widget
+    # state for controls that are not rendered on the current navigation page; this
+    # durable copy repopulates the controls when users return to Portfolio Lab.
+    st.session_state["portfolio_constraints"] = constraints_df.to_dict("records")
     allowed_cols = constraints_df.loc[~constraints_df["Exclude"], "Strategy"].tolist()
     if not allowed_cols:
         st.error("All strategies are excluded. Include at least one strategy.")
         return _add_active_composite(base_returns)
-    caps = dict(zip(constraints_df["Strategy"], constraints_df["Max Weight"]))
     opt_returns = opt_returns[allowed_cols]
     base_eval_returns = val_returns[allowed_cols].dropna(how="all")
     if base_eval_returns.empty:
         st.warning("Validation universe is empty after constraints; falling back to reporting universe for evaluation.")
         base_eval_returns = base_returns[allowed_cols].dropna(how="all")
     with st.spinner("Building candidate portfolios…"):
-        candidates, metrics = pl.candidate_portfolios(opt_returns, max_weight=float(max_weight), n_samples=int(n_samples), seed=int(seed))
-        candidates = {name: _apply_weight_caps(w.reindex(allowed_cols).fillna(0.0), caps) for name, w in candidates.items()}
+        # Generate unconstrained candidate ideas, then apply the explicit
+        # constraint layer. This makes per-strategy min/max/fixed overrides truly
+        # override the global max-weight setting.
+        candidates, metrics = pl.candidate_portfolios(opt_returns, max_weight=1.0, n_samples=int(n_samples), seed=int(seed))
+        candidates = {
+            name: _apply_allocation_overrides(w.reindex(allowed_cols).fillna(0.0), constraints_df, float(max_weight))
+            for name, w in candidates.items()
+        }
     if include_manual:
         with st.expander("Manual portfolio weights", expanded=False):
             manual = {}
             default = 100.0 / len(allowed_cols)
             for c in allowed_cols:
                 manual[c] = st.number_input(f"Manual weight: {c}", 0.0, 100.0, default, 5.0, key=f"manual_port_w_{c}") / 100.0
-            candidates["Manual"] = pl.normalize_weights(manual, allowed_cols, max_weight=1.0)
+            candidates["Manual"] = _apply_allocation_overrides(pl.normalize_weights(manual, allowed_cols, max_weight=1.0), constraints_df, float(max_weight))
             m = pl.portfolio_metrics(base_eval_returns, candidates["Manual"], "Manual")
             m["Concentration HHI"] = float((candidates["Manual"] ** 2).sum())
             m["Max Weight"] = float(candidates["Manual"].max())
@@ -1086,14 +1282,23 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
     with st.expander("Inverse-risk diagnostics", expanded=False):
         st.caption("Shows raw risk inputs, inverse-risk scores, uncapped normalized weights, and final capped weights. Useful when inverse-volatility or tail-risk parity appears close to equal weight.")
         d1, d2 = st.columns(2)
-        inv_diag = pl.inverse_risk_diagnostics(opt_returns, "inverse_volatility", max_weight=float(max_weight))
-        tail_diag = pl.inverse_risk_diagnostics(opt_returns, "tail_risk_parity", max_weight=float(max_weight))
+        inv_diag = pl.inverse_risk_diagnostics(opt_returns, "inverse_volatility", max_weight=1.0)
+        tail_diag = pl.inverse_risk_diagnostics(opt_returns, "tail_risk_parity", max_weight=1.0)
+        if not inv_diag.empty and "Inverse Volatility" in candidates:
+            inv_diag["Final After Overrides"] = inv_diag["Strategy"].map(candidates["Inverse Volatility"]).fillna(0.0)
+        if not tail_diag.empty and "Tail Risk Parity" in candidates:
+            tail_diag["Final After Overrides"] = tail_diag["Strategy"].map(candidates["Tail Risk Parity"]).fillna(0.0)
         d1.subheader("Inverse Volatility")
         d1.dataframe(readable_styler(inv_diag), use_container_width=True, hide_index=True)
         d2.subheader("Tail Risk Parity")
         d2.dataframe(readable_styler(tail_diag), use_container_width=True, hide_index=True)
 
-    selected_port = st.selectbox("Select active portfolio to analyze everywhere else", list(decision.index), index=0)
+    portfolio_options = list(decision.index)
+    previous_active = st.session_state.get("active_portfolio_name")
+    default_active_idx = portfolio_options.index(previous_active) if previous_active in portfolio_options else 0
+    if st.session_state.get("active_portfolio_selector") not in portfolio_options:
+        st.session_state["active_portfolio_selector"] = portfolio_options[default_active_idx]
+    selected_port = st.selectbox("Select active portfolio to analyze everywhere else", portfolio_options, index=default_active_idx, key="active_portfolio_selector")
     st.session_state["active_portfolio_name"] = selected_port
     st.session_state["active_portfolio_weights"] = candidates[selected_port].to_dict()
     weights = candidates[selected_port]
