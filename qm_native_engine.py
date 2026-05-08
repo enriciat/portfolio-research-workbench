@@ -2606,7 +2606,7 @@ def _resample_compounded(returns: "pd.Series", rule: str) -> List[float]:
 
 
 def _build_monthly_heatmap(returns: "pd.Series") -> Dict[str, Any]:
-    monthly = (1.0 + returns).resample("M").prod() - 1.0
+    monthly = (1.0 + returns).resample("ME").prod() - 1.0
     if monthly.empty:
         return {"years": [], "months": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], "values": []}
     years = sorted({int(ts.year) for ts in monthly.index})
@@ -2622,7 +2622,7 @@ def _build_monthly_heatmap(returns: "pd.Series") -> Dict[str, Any]:
 
 
 def _build_eoy_data(returns: "pd.Series") -> Dict[str, Any]:
-    yearly = (1.0 + returns).resample("Y").prod() - 1.0
+    yearly = (1.0 + returns).resample("YE").prod() - 1.0
     return {
         "years": [int(ts.year) for ts in yearly.index],
         "returns": [float(v) for v in yearly.tolist()],
@@ -2794,16 +2794,16 @@ def _compute_metric_bundle(returns: "pd.Series", benchmark: Optional["pd.Series"
     skew = _safe_qs(qs.stats.skew, ret)
     kurtosis = _safe_qs(qs.stats.kurtosis, ret)
     expected_daily = _safe_qs(qs.stats.expected_return, ret)
-    expected_month = _safe_qs(qs.stats.expected_return, ret, aggregate="M")
-    expected_year = _safe_qs(qs.stats.expected_return, ret, aggregate="A")
+    expected_month = _safe_qs(qs.stats.expected_return, ret, aggregate="ME")
+    expected_year = _safe_qs(qs.stats.expected_return, ret, aggregate="YE")
     daily_var = _safe_qs(qs.stats.var, ret)
     expected_shortfall = _safe_qs(qs.stats.expected_shortfall, ret)
     recovery_factor = _safe_qs(qs.stats.recovery_factor, ret, rf=rf)
     profit_factor = _safe_qs(qs.stats.profit_factor, ret)
 
-    monthly = (1.0 + ret).resample("M").prod() - 1.0
-    quarterly = (1.0 + ret).resample("Q").prod() - 1.0
-    yearly = (1.0 + ret).resample("Y").prod() - 1.0
+    monthly = (1.0 + ret).resample("ME").prod() - 1.0
+    quarterly = (1.0 + ret).resample("QE").prod() - 1.0
+    yearly = (1.0 + ret).resample("YE").prod() - 1.0
 
     def trailing_comp(series: "pd.Series", start_ts: "pd.Timestamp") -> Optional[float]:
         s = series[series.index >= start_ts]
@@ -2909,12 +2909,12 @@ def _compute_metric_bundle(returns: "pd.Series", benchmark: Optional["pd.Series"
         "all_time": cagr,
         "best_day": _safe_qs(qs.stats.best, ret),
         "worst_day": _safe_qs(qs.stats.worst, ret),
-        "best_month": _safe_qs(qs.stats.best, ret, aggregate="M"),
-        "worst_month": _safe_qs(qs.stats.worst, ret, aggregate="M"),
-        "best_year": _safe_qs(qs.stats.best, ret, aggregate="A"),
-        "worst_year": _safe_qs(qs.stats.worst, ret, aggregate="A"),
-        "avg_up_month": _safe_qs(qs.stats.avg_win, ret, aggregate="M"),
-        "avg_down_month": _safe_qs(qs.stats.avg_loss, ret, aggregate="M"),
+        "best_month": _safe_qs(qs.stats.best, ret, aggregate="ME"),
+        "worst_month": _safe_qs(qs.stats.worst, ret, aggregate="ME"),
+        "best_year": _safe_qs(qs.stats.best, ret, aggregate="YE"),
+        "worst_year": _safe_qs(qs.stats.worst, ret, aggregate="YE"),
+        "avg_up_month": _safe_qs(qs.stats.avg_win, ret, aggregate="ME"),
+        "avg_down_month": _safe_qs(qs.stats.avg_loss, ret, aggregate="ME"),
         "profit_factor": profit_factor,
         "win_ratio": (wins / float(losses)) if losses > 0 else (float("inf") if wins > 0 else 0.0),
         "win_days": float(wins),
@@ -3094,8 +3094,8 @@ def _write_report_html_rain_style(path: Path, out: BacktestOutput, benchmark: st
         "returns": s_ret,
         "drawdown": s_dd,
         "weeklyReturns": _resample_compounded(s_series, "W-FRI"),
-        "monthlyReturns": _resample_compounded(s_series, "M"),
-        "quarterlyReturns": _resample_compounded(s_series, "Q"),
+        "monthlyReturns": _resample_compounded(s_series, "ME"),
+        "quarterlyReturns": _resample_compounded(s_series, "QE"),
     }
     benchmark_data: Optional[Dict[str, Any]] = {
         "dates": b_dates,
@@ -3103,8 +3103,8 @@ def _write_report_html_rain_style(path: Path, out: BacktestOutput, benchmark: st
         "returns": b_ret,
         "drawdown": b_dd,
         "weeklyReturns": _resample_compounded(b_series, "W-FRI"),
-        "monthlyReturns": _resample_compounded(b_series, "M"),
-        "quarterlyReturns": _resample_compounded(b_series, "Q"),
+        "monthlyReturns": _resample_compounded(b_series, "ME"),
+        "quarterlyReturns": _resample_compounded(b_series, "QE"),
     } if b_dates else None
     chart_benchmark_data: Optional[Dict[str, Any]] = {
         "name": out.chart_benchmark_name,
