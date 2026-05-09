@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -106,6 +107,69 @@ def parse_uploaded_json(data: bytes) -> Tuple[Optional[Any], Optional[str]]:
         except Exception as exc:
             last = exc
     return None, f"Invalid JSON: {last}"
+
+
+def json_pool_id(name: str, raw: bytes) -> str:
+    """Stable id for a JSON upload, so files can be added in batches without duplicates."""
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    return f"{Path(name).stem}::{digest}"
+
+
+def json_pool_display_name(name: str, raw: bytes) -> str:
+    digest = hashlib.sha256(raw).hexdigest()[:8]
+    return f"{Path(name).stem} [{digest}].json"
+
+
+def get_json_pool() -> Dict[str, Dict[str, Any]]:
+    pool = st.session_state.setdefault("json_working_pool", {})
+    if not isinstance(pool, dict):
+        st.session_state["json_working_pool"] = {}
+        return st.session_state["json_working_pool"]
+    return pool
+
+
+def merge_backtest_runs(previous: Optional[BacktestRun], new: BacktestRun) -> BacktestRun:
+    """Merge a new partial run into an existing output set without rerunning old files."""
+    if previous is None:
+        return new
+    merged_dir = Path(tempfile.mkdtemp(prefix="qm_merged_outputs_"))
+
+    def copy_tree(src: str | Path) -> None:
+        srcp = Path(src)
+        if not srcp.exists():
+            return
+        for item in srcp.rglob("*"):
+            if not item.is_file():
+                continue
+            if item.name.endswith(".zip"):
+                continue
+            rel = item.relative_to(srcp)
+            dst = merged_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, dst)
+
+    copy_tree(previous.output_dir)
+    copy_tree(new.output_dir)
+    zip_path = merged_dir / "combined_outputs.zip"
+    zip_output_to_file(merged_dir, zip_path)
+    output_files = collect_output_files(merged_dir)
+    index = build_index_from_outputs(merged_dir)
+    return BacktestRun(
+        name="merged",
+        timestamp=time.time(),
+        stdout=(previous.stdout or "") + "\n\n--- MERGED NEW RUN ---\n" + (new.stdout or ""),
+        stderr=(previous.stderr or "") + "\n\n--- MERGED NEW RUN ---\n" + (new.stderr or ""),
+        returncode=0 if previous.returncode == 0 and new.returncode == 0 else 1,
+        output_dir=str(merged_dir),
+        zip_path=str(zip_path),
+        output_files=output_files,
+        index=index,
+        input_file_name="merged output set",
+        task_count=int(previous.task_count) + int(new.task_count),
+        parallel_strategy_level=bool(previous.parallel_strategy_level or new.parallel_strategy_level),
+        task_results=list(previous.task_results) + list(new.task_results),
+        wrapper_warnings=list(previous.wrapper_warnings) + list(new.wrapper_warnings),
+    )
 
 
 def strategy_depth(path: str) -> int:
@@ -460,14 +524,14 @@ def render_task_status(run: BacktestRun) -> None:
         df = pd.DataFrame([t.__dict__ for t in run.task_results])
         show = df[["task_id", "display_name", "status", "returncode", "elapsed", "output_count", "output_bytes", "error"]].copy()
         show["output_bytes"] = show["output_bytes"].map(human_size)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width="stretch", hide_index=True)
         status_counts = show["status"].value_counts().reset_index()
         status_counts.columns = ["Status", "Count"]
         c1, c2 = st.columns([1, 1])
         with c1:
-            st.plotly_chart(px.bar(status_counts, x="Status", y="Count", title="Task status counts", text="Count"), use_container_width=True)
+            st.plotly_chart(px.bar(status_counts, x="Status", y="Count", title="Task status counts", text="Count"), width="stretch")
         with c2:
-            st.plotly_chart(px.histogram(df, x="elapsed", nbins=20, title="Task runtime distribution"), use_container_width=True)
+            st.plotly_chart(px.histogram(df, x="elapsed", nbins=20, title="Task runtime distribution"), width="stretch")
     if run.wrapper_warnings:
         st.warning("Wrapper warnings:\n" + "\n".join(f"- {w}" for w in run.wrapper_warnings))
 
@@ -503,14 +567,14 @@ def render_index(run: BacktestRun) -> None:
         rows.append(row)
     df = pd.DataFrame(rows)
     fmt = {"CAGR": "{:.2%}", "Max DD": "{:.2%}", "Sharpe": "{:.2f}", "Sortino": "{:.2f}"}
-    st.dataframe(df.style.format({k: v for k, v in fmt.items() if k in df.columns}), use_container_width=True, hide_index=True)
+    st.dataframe(df.style.format({k: v for k, v in fmt.items() if k in df.columns}), width="stretch", hide_index=True)
     if "Warnings" in df.columns and df["Warnings"].sum() > 0:
-        st.plotly_chart(px.bar(df.sort_values("Warnings", ascending=False), x="Strategy", y="Warnings", title="Warnings by strategy"), use_container_width=True)
+        st.plotly_chart(px.bar(df.sort_values("Warnings", ascending=False), x="Strategy", y="Warnings", title="Warnings by strategy"), width="stretch")
 
 
 def render_downloads(run: BacktestRun) -> None:
     if run.zip_path and Path(run.zip_path).exists():
-        st.download_button("Download all outputs as ZIP", safe_read(run.zip_path), file_name="quantmage_backtest_outputs.zip", mime="application/zip", use_container_width=True)
+        st.download_button("Download all outputs as ZIP", safe_read(run.zip_path), file_name="quantmage_backtest_outputs.zip", mime="application/zip", width="stretch")
     if not run.output_files:
         return
     st.subheader("Generated files")
@@ -524,8 +588,8 @@ def render_downloads(run: BacktestRun) -> None:
     file_counts = pd.DataFrame([{"Type": k, "Count": len(v), "Size": sum(f["size"] for f in v)} for k, v in by_type.items() if v])
     if not file_counts.empty:
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.bar(file_counts, x="Type", y="Count", title="Output files by type", text="Count"), use_container_width=True)
-        c2.plotly_chart(px.pie(file_counts, names="Type", values="Size", title="Output size by type"), use_container_width=True)
+        c1.plotly_chart(px.bar(file_counts, x="Type", y="Count", title="Output files by type", text="Count"), width="stretch")
+        c2.plotly_chart(px.pie(file_counts, names="Type", values="Size", title="Output size by type"), width="stretch")
     for label, files in by_type.items():
         if not files:
             continue
@@ -561,16 +625,16 @@ def render_report_preview(run: BacktestRun) -> None:
         {"Check": "Mentions Plotly", "Value": "plotly" in html_text.lower()},
         {"Check": "Fallback preview available", "Value": bool(run.index.get("items"))},
     ])
-    st.dataframe(health, use_container_width=True, hide_index=True)
+    st.dataframe(health, width="stretch", hide_index=True)
     mode = st.radio("Preview mode", ["Safe internal preview", "Native HTML iframe", "HTML source snippet"], horizontal=True)
     if mode == "Native HTML iframe":
         st.warning("Some standalone reports render blank inside Streamlit if their JavaScript expects a full browser page. Use the safe preview or download the report if this pane is blank.")
         height = st.slider("Preview height", 500, 1800, 1000, 100)
         components.html(html_text, height=height, scrolling=True)
-        st.download_button("Download this HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", use_container_width=True)
+        st.download_button("Download this HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", width="stretch")
         return
     if mode == "HTML source snippet":
-        st.download_button("Download this HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", use_container_width=True)
+        st.download_button("Download this HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", width="stretch")
         st.code(html_text[:30000], language="html")
         return
 
@@ -599,7 +663,7 @@ def render_report_preview(run: BacktestRun) -> None:
         item = candidates[0] if candidates else None
     if item is None:
         st.warning("Could not connect this report to equity/allocation CSV. The standalone download is still available.")
-        st.download_button("Download this HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", use_container_width=True)
+        st.download_button("Download this HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", width="stretch")
         return
     eq_path = item.get("equity_csv")
     alloc_path = item.get("allocation_csv")
@@ -619,13 +683,13 @@ def render_report_preview(run: BacktestRun) -> None:
                 eq = eq.dropna(subset=["Date"]).set_index("Date")
                 plot_cols = [c for c in ["Strategy Equity", "Benchmark Equity"] if c in eq.columns]
                 if plot_cols:
-                    st.plotly_chart(px.line(eq[plot_cols], title="Equity preview", log_y=True), use_container_width=True)
+                    st.plotly_chart(px.line(rebased_level_curve(eq[plot_cols], "safe_preview_equity_tf", "Equity preview timeframe"), title="Equity preview", log_y=True), width="stretch")
                 if "Strategy Equity" in eq.columns:
                     r = pd.to_numeric(eq["Strategy Equity"], errors="coerce").pct_change().dropna()
                     summary = ap.perf_summary(pd.DataFrame({str(item.get("name", "Strategy")): r}))
                     if not summary.empty:
-                        st.dataframe(summary.style.format({c: "{:.4f}" for c in summary.select_dtypes("number").columns}), use_container_width=True)
-                    st.plotly_chart(px.line(ap.drawdowns(pd.DataFrame({"Drawdown": r})), title="Drawdown preview"), use_container_width=True)
+                        st.dataframe(summary.style.format({c: "{:.4f}" for c in summary.select_dtypes("number").columns}), width="stretch")
+                    st.plotly_chart(px.line(drawdown_from_returns(pd.DataFrame({"Drawdown": r}), "safe_preview_drawdown_tf", "Drawdown preview timeframe"), title="Drawdown preview"), width="stretch")
             except Exception as exc:
                 st.error(f"Safe equity preview failed: {exc}")
     if alloc_path:
@@ -634,7 +698,7 @@ def render_report_preview(run: BacktestRun) -> None:
             try:
                 adf = pd.read_csv(af["full_path"])
                 st.subheader("Allocation file preview")
-                st.dataframe(adf.tail(25), use_container_width=True, hide_index=True)
+                st.dataframe(adf.tail(25), width="stretch", hide_index=True)
             except Exception as exc:
                 st.warning(f"Could not preview allocation CSV: {exc}")
     if warn_path:
@@ -648,7 +712,7 @@ def render_report_preview(run: BacktestRun) -> None:
         if df:
             with st.expander("Start diagnostics", expanded=False):
                 st.text(safe_read(df["full_path"]).decode("utf-8", errors="ignore")[:20000])
-    st.download_button("Download full standalone HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", use_container_width=True)
+    st.download_button("Download full standalone HTML report", safe_read(f["full_path"]), file_name=Path(selected).name, mime="text/html", width="stretch")
 
 def build_composite_ui(returns_df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.Series], Dict[str, float]]:
     if returns_df.shape[1] < 2:
@@ -671,8 +735,8 @@ def build_composite_ui(returns_df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional
             weights = {c: st.number_input(f"Weight: {c}", 0.0, 100.0, 100.0 / len(cols), 5.0, key=f"cw_{c}") / 100 for c in cols}
         weight_df = pd.DataFrame({"Strategy": list(weights.keys()), "Weight": list(weights.values())})
         c1, c2 = st.columns([1, 1])
-        c1.dataframe(weight_df.style.format({"Weight": "{:.2%}"}), use_container_width=True, hide_index=True)
-        c2.plotly_chart(px.pie(weight_df, names="Strategy", values="Weight", title="Composite weights"), use_container_width=True)
+        c1.dataframe(weight_df.style.format({"Weight": "{:.2%}"}), width="stretch", hide_index=True)
+        c2.plotly_chart(px.pie(weight_df, names="Strategy", values="Weight", title="Composite weights"), width="stretch")
         comp = ap.composite_returns(returns_df, weights)
         out = returns_df.copy()
         out[comp.name] = comp
@@ -688,17 +752,17 @@ def render_visual_metric_companions(summary: pd.DataFrame) -> None:
         x_axis = risk_return_x_axis("performance_risk_return_x")
         if "CAGR" in df.columns and x_axis in df.columns:
             size_col = "Volatility" if x_axis != "Volatility" and "Volatility" in df.columns else ("Max Drawdown" if "Max Drawdown" in df.columns else None)
-            st.plotly_chart(px.scatter(df, x=x_axis, y="CAGR", size=size_col, hover_name="Strategy", title=f"Risk/return map: CAGR vs {x_axis}"), use_container_width=True)
+            st.plotly_chart(px.scatter(df, x=x_axis, y="CAGR", size=size_col, hover_name="Strategy", title=f"Risk/return map: CAGR vs {x_axis}"), width="stretch")
     with c2:
         if "Sharpe" in df.columns:
-            st.plotly_chart(px.bar(df.sort_values("Sharpe", ascending=False), x="Strategy", y="Sharpe", title="Sharpe ranking"), use_container_width=True)
+            st.plotly_chart(px.bar(df.sort_values("Sharpe", ascending=False), x="Strategy", y="Sharpe", title="Sharpe ranking"), width="stretch")
     c3, c4 = st.columns(2)
     with c3:
         if "Max Drawdown" in df.columns:
-            st.plotly_chart(px.bar(df.sort_values("Max Drawdown"), x="Strategy", y="Max Drawdown", title="Max drawdown ranking"), use_container_width=True)
+            st.plotly_chart(px.bar(df.sort_values("Max Drawdown"), x="Strategy", y="Max Drawdown", title="Max drawdown ranking"), width="stretch")
     with c4:
         if "cVaR 95" in df.columns:
-            st.plotly_chart(px.bar(df.sort_values("cVaR 95"), x="Strategy", y="cVaR 95", title="Left-tail cVaR ranking"), use_container_width=True)
+            st.plotly_chart(px.bar(df.sort_values("cVaR 95"), x="Strategy", y="cVaR 95", title="Left-tail cVaR ranking"), width="stretch")
 
 
 
@@ -744,6 +808,138 @@ def display_readable_table(df: pd.DataFrame, *args, **kwargs) -> None:
 
 def risk_return_x_axis(key: str = "risk_return_x_axis") -> str:
     return st.selectbox("Risk/return X-axis", ["Max Drawdown", "Volatility", "cVaR 95"], index=0, key=key)
+
+
+CURVE_POINT_OPTIONS = {
+    "Fast preview (~1k points)": 1000,
+    "Balanced (~2.5k points)": 2500,
+    "Detailed (~5k points)": 5000,
+    "Full detail": 0,
+}
+
+
+def curve_display_controls() -> None:
+    """Global display-only controls for time-series charts.
+
+    These settings never change calculations or exported data; they only reduce
+    how many points are sent to the browser. This keeps Streamlit Cloud stable
+    while preserving full-resolution downloads and metrics.
+    """
+    with st.expander("Curve chart display settings", expanded=False):
+        st.selectbox(
+            "Maximum displayed points per curve",
+            list(CURVE_POINT_OPTIONS.keys()),
+            index=1,
+            key="curve_point_mode",
+            help="Display-only downsampling for long curves. Calculations and exports remain full resolution.",
+        )
+        st.caption("Use the timeframe sliders on curve charts to rebase equity curves to the selected start date. Drawdowns are recalculated from that selected start.")
+
+
+def _curve_max_points() -> int:
+    mode = st.session_state.get("curve_point_mode", "Balanced (~2.5k points)")
+    return int(CURVE_POINT_OPTIONS.get(mode, 2500))
+
+
+def _ensure_datetime_index(df: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        try:
+            out.index = pd.to_datetime(out.index)
+        except Exception:
+            return out
+    try:
+        return out.sort_index()
+    except Exception:
+        return out
+
+
+def _downsample_timeseries(obj: pd.DataFrame | pd.Series, max_points: Optional[int] = None) -> pd.DataFrame | pd.Series:
+    """Downsample display data without changing calculations. Keeps the last point."""
+    if obj is None or len(obj) == 0:
+        return obj
+    if max_points is None:
+        max_points = _curve_max_points()
+    if not max_points or len(obj) <= max_points:
+        return obj
+    step = max(1, int(np.ceil(len(obj) / float(max_points))))
+    out = obj.iloc[::step].copy()
+    if len(out) == 0 or out.index[-1] != obj.index[-1]:
+        out = pd.concat([out, obj.iloc[[-1]]])
+    return out
+
+
+def _curve_timeframe(obj: pd.DataFrame | pd.Series, key: str, label: str = "Chart timeframe") -> pd.DataFrame | pd.Series:
+    """Return the user-selected time slice for a curve chart."""
+    obj = _ensure_datetime_index(obj)
+    if obj is None or len(obj) < 2 or not isinstance(obj.index, pd.DatetimeIndex):
+        return obj
+    valid_idx = obj.index.dropna()
+    if len(valid_idx) < 2:
+        return obj
+    start = valid_idx.min().to_pydatetime()
+    end = valid_idx.max().to_pydatetime()
+    try:
+        picked = st.slider(label, min_value=start, max_value=end, value=(start, end), format="YYYY-MM-DD", key=key)
+        start_sel, end_sel = picked
+        start_ts = pd.Timestamp(start_sel)
+        end_ts = pd.Timestamp(end_sel)
+        if end_ts < start_ts:
+            start_ts, end_ts = end_ts, start_ts
+        return obj.loc[(obj.index >= start_ts) & (obj.index <= end_ts)].copy()
+    except Exception:
+        # If Streamlit cannot render the date slider for any reason, fall back to full range.
+        return obj
+
+
+def _rebase_level_curve(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy().astype(float)
+    first = out.iloc[0].replace(0, np.nan)
+    out = out.divide(first)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def curve_from_returns(returns: pd.DataFrame | pd.Series, key: str, label: str = "Chart timeframe") -> pd.DataFrame:
+    """Slice returns, then rebuild an equity curve rebased to 1.0 at the selected start."""
+    if isinstance(returns, pd.Series):
+        returns = returns.to_frame()
+    sliced = _curve_timeframe(returns, key, label)
+    if sliced is None or sliced.empty:
+        return pd.DataFrame()
+    eq = (1.0 + sliced.fillna(0.0)).cumprod()
+    eq = _rebase_level_curve(eq)
+    return _downsample_timeseries(eq)
+
+
+def drawdown_from_returns(returns: pd.DataFrame | pd.Series, key: str, label: str = "Drawdown timeframe") -> pd.DataFrame:
+    """Slice returns and recalculate drawdown from the selected start date."""
+    if isinstance(returns, pd.Series):
+        returns = returns.to_frame()
+    sliced = _curve_timeframe(returns, key, label)
+    if sliced is None or sliced.empty:
+        return pd.DataFrame()
+    dd = ap.drawdowns(sliced.fillna(0.0))
+    return _downsample_timeseries(dd)
+
+
+def rebased_level_curve(levels: pd.DataFrame | pd.Series, key: str, label: str = "Chart timeframe") -> pd.DataFrame:
+    """Slice an existing level/equity curve and rebase it to 1.0 at the selected start."""
+    if isinstance(levels, pd.Series):
+        levels = levels.to_frame()
+    sliced = _curve_timeframe(levels, key, label)
+    if sliced is None or sliced.empty:
+        return pd.DataFrame()
+    return _downsample_timeseries(_rebase_level_curve(sliced))
+
+
+def sliced_timeseries(obj: pd.DataFrame | pd.Series, key: str, label: str = "Chart timeframe") -> pd.DataFrame | pd.Series:
+    """Slice a non-equity time series and downsample for display only."""
+    sliced = _curve_timeframe(obj, key, label)
+    return _downsample_timeseries(sliced)
 
 
 def correlation_with_mean_column(corr: pd.DataFrame) -> pd.DataFrame:
@@ -898,7 +1094,7 @@ def render_data_universe_panel(base_returns: pd.DataFrame) -> Dict[str, Any]:
         }
         modes = {"analysis": analysis_mode, "optimization": optimization_mode, "validation": validation_mode, "simulation": simulation_mode, "stress": stress_mode}
         stats = pd.DataFrame([_universe_stats(k.title(), v) | {"Mode": modes[k]} for k, v in universes.items()])
-        display_readable_table(stats, use_container_width=True, hide_index=True)
+        display_readable_table(stats, width="stretch", hide_index=True)
         if any(v.empty for v in universes.values()):
             st.warning("At least one selected data universe is empty. Affected modules will fall back to the reporting universe where needed.")
         st.session_state["data_universe_modes"] = modes
@@ -1105,21 +1301,13 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
     val_returns = _safe_universe(validation_universe, base_returns)
     universe_labels = universe_labels or {}
     saved_settings = _portfolio_lab_saved_settings()
-    if "portfolio_max_weight_widget" not in st.session_state:
-        st.session_state["portfolio_max_weight_widget"] = float(saved_settings.get("max_weight", 0.50))
-    if "portfolio_n_samples_widget" not in st.session_state:
-        st.session_state["portfolio_n_samples_widget"] = int(saved_settings.get("n_samples", 600))
-    if "portfolio_seed_widget" not in st.session_state:
-        st.session_state["portfolio_seed_widget"] = int(saved_settings.get("seed", 42))
-    if "portfolio_include_manual_widget" not in st.session_state:
-        st.session_state["portfolio_include_manual_widget"] = bool(saved_settings.get("include_manual", True))
 
     with st.expander("Portfolio construction controls", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
-        max_weight = c1.slider("Max weight per strategy", 0.10, 1.00, 0.50, 0.05, key="portfolio_max_weight_widget")
-        n_samples = c2.slider("Random-search samples", 100, 3000, 600, 100, key="portfolio_n_samples_widget")
-        seed = c3.number_input("Optimizer seed", min_value=1, max_value=999999, value=42, step=1, key="portfolio_seed_widget")
-        include_manual = c4.checkbox("Create manual portfolio", value=True, key="portfolio_include_manual_widget")
+        max_weight = c1.slider("Max weight per strategy", 0.10, 1.00, float(saved_settings.get("max_weight", 0.50)), 0.05, key="portfolio_max_weight_widget")
+        n_samples = c2.slider("Random-search samples", 100, 3000, int(saved_settings.get("n_samples", 600)), 100, key="portfolio_n_samples_widget")
+        seed = c3.number_input("Optimizer seed", min_value=1, max_value=999999, value=int(saved_settings.get("seed", 42)), step=1, key="portfolio_seed_widget")
+        include_manual = c4.checkbox("Create manual portfolio", value=bool(saved_settings.get("include_manual", True)), key="portfolio_include_manual_widget")
         st.session_state["portfolio_lab_settings"] = {
             "max_weight": float(max_weight),
             "n_samples": int(n_samples),
@@ -1144,7 +1332,7 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
             {"Method": "Robust Recommended", "Correlation Use": "Implicit + penalty", "Notes": "Uses combined portfolio metrics plus concentration/tail-correlation penalties."},
         ])
         with st.expander("How each optimizer uses correlation", expanded=False):
-            display_readable_table(usage, use_container_width=True, hide_index=True)
+            display_readable_table(usage, width="stretch", hide_index=True)
 
     saved_constraints = _saved_constraint_map()
     with st.expander("Per-strategy constraints", expanded=False):
@@ -1193,7 +1381,7 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
             ),
             axis=1,
         )
-        display_readable_table(preview[["Strategy", "Exclude", "Constraint Type", "Allocation", "Effective Rule"]], use_container_width=True, hide_index=True)
+        display_readable_table(preview[["Strategy", "Exclude", "Constraint Type", "Allocation", "Effective Rule"]], width="stretch", hide_index=True)
     # Save immediately to a durable non-widget state object. Streamlit deletes widget
     # state for controls that are not rendered on the current navigation page; this
     # durable copy repopulates the controls when users return to Portfolio Lab.
@@ -1251,33 +1439,33 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
         val_metrics = pd.DataFrame(val_rows).set_index("Portfolio") if val_rows else pd.DataFrame()
         if not val_metrics.empty:
             st.subheader("Validation-universe candidate performance")
-            display_readable_table(val_metrics, use_container_width=True)
+            display_readable_table(val_metrics, width="stretch")
             vdf = val_metrics.reset_index()
             x_axis = risk_return_x_axis("validation_risk_return_x")
             if x_axis in vdf.columns:
                 size_col = "Volatility" if x_axis != "Volatility" else ("Max Drawdown" if "Max Drawdown" in vdf.columns else None)
-                st.plotly_chart(px.scatter(vdf, x=x_axis, y="CAGR", size=size_col, hover_name="Portfolio", title=f"Validation-universe risk/return map: CAGR vs {x_axis}"), use_container_width=True)
+                st.plotly_chart(px.scatter(vdf, x=x_axis, y="CAGR", size=size_col, hover_name="Portfolio", title=f"Validation-universe risk/return map: CAGR vs {x_axis}"), width="stretch")
 
     st.subheader("Candidate portfolio decision table")
     num_cols = decision.select_dtypes("number").columns
-    display_readable_table(decision, use_container_width=True)
+    display_readable_table(decision, width="stretch")
     # Visual companions for the table.
     dfp = decision.reset_index()
     c1, c2 = st.columns(2)
     x_axis = risk_return_x_axis("candidate_risk_return_x")
     if x_axis in dfp.columns:
         size_col = "Volatility" if x_axis != "Volatility" else ("Max Drawdown" if "Max Drawdown" in dfp.columns else None)
-        c1.plotly_chart(px.scatter(dfp, x=x_axis, y="CAGR", size=size_col, color="Classification", hover_name="Portfolio", title=f"Candidate risk/return map: CAGR vs {x_axis}"), use_container_width=True)
-    c2.plotly_chart(px.bar(dfp.sort_values("Decision Score", ascending=False), x="Portfolio", y="Decision Score", color="Classification", title="Decision-score ranking"), use_container_width=True)
+        c1.plotly_chart(px.scatter(dfp, x=x_axis, y="CAGR", size=size_col, color="Classification", hover_name="Portfolio", title=f"Candidate risk/return map: CAGR vs {x_axis}"), width="stretch")
+    c2.plotly_chart(px.bar(dfp.sort_values("Decision Score", ascending=False), x="Portfolio", y="Decision Score", color="Classification", title="Decision-score ranking"), width="stretch")
     c3, c4 = st.columns(2)
-    c3.plotly_chart(px.bar(dfp.sort_values("cVaR 95"), x="Portfolio", y="cVaR 95", title="Candidate left-tail cVaR ranking"), use_container_width=True)
-    c4.plotly_chart(px.bar(dfp.sort_values("Max Drawdown"), x="Portfolio", y="Max Drawdown", title="Candidate max-drawdown ranking"), use_container_width=True)
+    c3.plotly_chart(px.bar(dfp.sort_values("cVaR 95"), x="Portfolio", y="cVaR 95", title="Candidate left-tail cVaR ranking"), width="stretch")
+    c4.plotly_chart(px.bar(dfp.sort_values("Max Drawdown"), x="Portfolio", y="Max Drawdown", title="Candidate max-drawdown ranking"), width="stretch")
 
     st.subheader("Candidate weights overview")
     weights_wide = pd.DataFrame({name: w.reindex(allowed_cols).fillna(0.0) for name, w in candidates.items()}).T
-    st.plotly_chart(px.imshow(weights_wide, text_auto=".1%", color_continuous_scale="Blues", aspect="auto", title="Candidate weight heatmap"), use_container_width=True)
+    st.plotly_chart(px.imshow(weights_wide, text_auto=".1%", color_continuous_scale="Blues", aspect="auto", title="Candidate weight heatmap"), width="stretch")
     weights_long = weights_wide.reset_index().rename(columns={"index": "Portfolio"}).melt(id_vars="Portfolio", var_name="Strategy", value_name="Weight")
-    st.plotly_chart(px.bar(weights_long, x="Portfolio", y="Weight", color="Strategy", title="Candidate weights stacked bar", barmode="stack"), use_container_width=True)
+    st.plotly_chart(px.bar(weights_long, x="Portfolio", y="Weight", color="Strategy", title="Candidate weights stacked bar", barmode="stack"), width="stretch")
 
     with st.expander("Inverse-risk diagnostics", expanded=False):
         st.caption("Shows raw risk inputs, inverse-risk scores, uncapped normalized weights, and final capped weights. Useful when inverse-volatility or tail-risk parity appears close to equal weight.")
@@ -1289,9 +1477,9 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
         if not tail_diag.empty and "Tail Risk Parity" in candidates:
             tail_diag["Final After Overrides"] = tail_diag["Strategy"].map(candidates["Tail Risk Parity"]).fillna(0.0)
         d1.subheader("Inverse Volatility")
-        d1.dataframe(readable_styler(inv_diag), use_container_width=True, hide_index=True)
+        d1.dataframe(readable_styler(inv_diag), width="stretch", hide_index=True)
         d2.subheader("Tail Risk Parity")
-        d2.dataframe(readable_styler(tail_diag), use_container_width=True, hide_index=True)
+        d2.dataframe(readable_styler(tail_diag), width="stretch", hide_index=True)
 
     portfolio_options = list(decision.index)
     previous_active = st.session_state.get("active_portfolio_name")
@@ -1306,23 +1494,23 @@ def render_portfolio_lab(base_returns: pd.DataFrame, opt_universe: Optional[pd.D
     st.subheader(f"Selected weights: {selected_port}")
     wdf = pd.DataFrame({"Strategy": weights.index, "Weight": weights.values}).sort_values("Weight", ascending=False)
     c1, c2 = st.columns(2)
-    c1.dataframe(readable_styler(wdf), use_container_width=True, hide_index=True)
-    c2.plotly_chart(px.pie(wdf, names="Strategy", values="Weight", title="Selected portfolio weights", hole=0.35), use_container_width=True)
-    st.plotly_chart(px.bar(wdf, x="Strategy", y="Weight", title="Selected portfolio weights"), use_container_width=True)
+    c1.dataframe(readable_styler(wdf), width="stretch", hide_index=True)
+    c2.plotly_chart(px.pie(wdf, names="Strategy", values="Weight", title="Selected portfolio weights", hole=0.35), width="stretch")
+    st.plotly_chart(px.bar(wdf, x="Strategy", y="Weight", title="Selected portfolio weights"), width="stretch")
 
     rc = pl.risk_contributions(base_returns, weights)
     if not rc.empty:
         st.subheader("Risk contribution")
-        display_readable_table(rc, use_container_width=True, hide_index=True)
+        display_readable_table(rc, width="stretch", hide_index=True)
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.bar(rc, x="Strategy", y="Volatility Contribution", title="Volatility risk contribution"), use_container_width=True)
-        c2.plotly_chart(px.bar(rc, x="Strategy", y="Approx cVaR Contribution", title="Approximate cVaR contribution"), use_container_width=True)
+        c1.plotly_chart(px.bar(rc, x="Strategy", y="Volatility Contribution", title="Volatility risk contribution"), width="stretch")
+        c2.plotly_chart(px.bar(rc, x="Strategy", y="Approx cVaR Contribution", title="Approximate cVaR contribution"), width="stretch")
 
     cand_rets = pd.DataFrame({name: pl.portfolio_returns(base_eval_returns, w, name) for name, w in candidates.items()})
     st.subheader("Candidate equity and drawdown comparison")
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.line((1 + cand_rets.fillna(0)).cumprod(), title="Candidate equity curves", log_y=True), use_container_width=True)
-    c2.plotly_chart(px.line(pl.drawdowns(cand_rets), title="Candidate drawdowns"), use_container_width=True)
+    c1.plotly_chart(px.line(curve_from_returns(cand_rets, "portfolio_lab_candidate_equity_tf", "Candidate equity timeframe"), title="Candidate equity curves", log_y=True), width="stretch")
+    c2.plotly_chart(px.line(drawdown_from_returns(cand_rets, "portfolio_lab_candidate_drawdown_tf", "Candidate drawdown timeframe"), title="Candidate drawdowns"), width="stretch")
 
     st.download_button("Download candidate metrics CSV", decision.to_csv().encode("utf-8"), file_name="portfolio_candidate_metrics.csv", mime="text/csv")
     st.session_state["portfolio_candidates"] = {k: v.to_dict() for k, v in candidates.items()}
@@ -1337,6 +1525,29 @@ def render_correlation_stress_lab(base_returns: pd.DataFrame, returns_with_compo
     if base_returns.shape[1] < 2:
         st.warning("Need at least two strategies for correlation stress analysis.")
         return
+    available_cols = list(base_returns.columns)
+    saved_corr_cols = st.session_state.get("correlation_lab_strategy_filter", available_cols)
+    default_corr_cols = [c for c in saved_corr_cols if c in available_cols] or available_cols
+    selected_corr_cols = st.multiselect(
+        "Strategies included in Correlation Lab",
+        available_cols,
+        default=default_corr_cols,
+        help="Correlation-lab-only filter. Excluded strategies remain available elsewhere unless you also remove them in the global workbench filter.",
+    )
+    if len(selected_corr_cols) < 2:
+        st.warning("Select at least two strategies for correlation analysis.")
+        return
+    st.session_state["correlation_lab_strategy_filter"] = selected_corr_cols
+    base_returns = base_returns[selected_corr_cols]
+    corr_weights = weights.reindex(selected_corr_cols).fillna(0.0)
+    if corr_weights.sum() <= 0:
+        corr_weights = pd.Series(1.0 / len(selected_corr_cols), index=selected_corr_cols)
+    else:
+        corr_weights = corr_weights / corr_weights.sum()
+    returns_with_composite = base_returns.copy()
+    returns_with_composite["Composite Portfolio"] = pl.portfolio_returns(base_returns, corr_weights, "Composite Portfolio")
+    weights = corr_weights
+    st.caption("The Correlation Lab composite is recomputed from the included strategies and normalized active weights.")
     c1, c2, c3, c4 = st.columns(4)
     method = c1.selectbox("Correlation method", ["pearson", "spearman", "kendall"], index=0)
     trigger = c2.selectbox("Tail trigger", returns_with_composite.columns, index=list(returns_with_composite.columns).index("Composite Portfolio") if "Composite Portfolio" in returns_with_composite.columns else 0)
@@ -1347,28 +1558,28 @@ def render_correlation_stress_lab(base_returns: pd.DataFrame, returns_with_compo
     corr_view = correlation_with_mean_column(corr)
     tail_corr_view = correlation_with_mean_column(tail_corr)
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.imshow(corr_view, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title="Normal correlation matrix + Mean"), use_container_width=True)
-    c2.plotly_chart(px.imshow(tail_corr_view, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title=f"Tail correlation matrix + Mean ({n_tail} obs)"), use_container_width=True)
+    c1.plotly_chart(px.imshow(corr_view, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title="Normal correlation matrix + Mean"), width="stretch")
+    c2.plotly_chart(px.imshow(tail_corr_view, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title=f"Tail correlation matrix + Mean ({n_tail} obs)"), width="stretch")
     m1, m2 = st.columns(2)
     mt = mean_correlation_table(corr, "Mean Corr")
     tt = mean_correlation_table(tail_corr, "Mean Tail Corr")
     if not mt.empty:
         m1.subheader("Mean correlation by strategy")
-        m1.dataframe(readable_styler(mt), use_container_width=True, hide_index=True)
+        m1.dataframe(readable_styler(mt), width="stretch", hide_index=True)
     if not tt.empty:
         m2.subheader("Mean tail correlation by strategy")
-        m2.dataframe(readable_styler(tt), use_container_width=True, hide_index=True)
+        m2.dataframe(readable_styler(tt), width="stretch", hide_index=True)
     sim = ap.similarity_pairs(base_returns, threshold=sim_threshold)
     if not sim.empty:
         st.warning("Potential strategy redundancy detected. These pairs may not provide true diversification.")
-        st.dataframe(sim.style.format({"Correlation": "{:.3f}"}), use_container_width=True, hide_index=True)
-        st.plotly_chart(px.bar(sim, x="Strategy A", y="Correlation", color="Strategy B", title="Highly similar strategy pairs"), use_container_width=True)
+        st.dataframe(sim.style.format({"Correlation": "{:.3f}"}), width="stretch", hide_index=True)
+        st.plotly_chart(px.bar(sim, x="Strategy A", y="Correlation", color="Strategy B", title="Highly similar strategy pairs"), width="stretch")
     st.subheader("Hierarchical clustering")
     try:
         linkage = ap.cluster_linkage(base_returns)
         fig = ff.create_dendrogram(base_returns.corr(), labels=list(base_returns.columns), linkagefun=lambda _: linkage)
         fig.update_layout(height=550)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     except Exception as exc:
         st.warning(f"Could not build dendrogram: {exc}")
 
@@ -1382,15 +1593,15 @@ def render_correlation_stress_lab(base_returns: pd.DataFrame, returns_with_compo
         normal = stress["base_metrics"]
         stressed = stress["stress_metrics"]
         stress_table = pd.DataFrame([normal, stressed], index=["Base composite", "Synthetic stress composite"])
-        st.dataframe(stress_table.style.format({c: "{:.4f}" for c in stress_table.select_dtypes("number").columns}), use_container_width=True)
+        st.dataframe(stress_table.style.format({c: "{:.4f}" for c in stress_table.select_dtypes("number").columns}), width="stretch")
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.imshow(correlation_with_mean_column(stress["stress_corr"]), text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Stressed correlation matrix + Mean"), use_container_width=True)
+        c1.plotly_chart(px.imshow(correlation_with_mean_column(stress["stress_corr"]), text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Stressed correlation matrix + Mean"), width="stretch")
         comparison = pd.DataFrame({"Base": stress["base_series"], "Synthetic stress": stress["stress_series"]})
-        c2.plotly_chart(px.line((1 + comparison).cumprod(), title="Base vs synthetic stress equity", log_y=True), use_container_width=True)
+        c2.plotly_chart(px.line(curve_from_returns(comparison, "stress_equity_comparison_tf", "Stress equity timeframe"), title="Base vs synthetic stress equity", log_y=True), width="stretch")
         mdf = stress_table.reset_index().rename(columns={"index": "Scenario"})
         c3, c4 = st.columns(2)
-        c3.plotly_chart(px.bar(mdf, x="Scenario", y="Max Drawdown", title="Stress max drawdown impact"), use_container_width=True)
-        c4.plotly_chart(px.bar(mdf, x="Scenario", y="cVaR 95", title="Stress cVaR impact"), use_container_width=True)
+        c3.plotly_chart(px.bar(mdf, x="Scenario", y="Max Drawdown", title="Stress max drawdown impact"), width="stretch")
+        c4.plotly_chart(px.bar(mdf, x="Scenario", y="cVaR 95", title="Stress cVaR impact"), width="stretch")
 
     st.subheader("Rolling pairwise correlation")
     left_col, right_col = st.columns(2)
@@ -1398,7 +1609,7 @@ def render_correlation_stress_lab(base_returns: pd.DataFrame, returns_with_compo
     right = right_col.selectbox("Second strategy", base_returns.columns, index=min(1, len(base_returns.columns) - 1))
     window = st.slider("Rolling correlation window", 21, 504, 63)
     if left != right:
-        st.plotly_chart(px.line(ap.rolling_corr(base_returns, left, right, window=window), title=f"Rolling correlation: {left} vs {right}"), use_container_width=True)
+        st.plotly_chart(px.line(sliced_timeseries(ap.rolling_corr(base_returns, left, right, window=window), "rolling_corr_tf", "Rolling-correlation timeframe"), title=f"Rolling correlation: {left} vs {right}"), width="stretch")
 
 
 def render_monte_carlo_lab(base_returns: pd.DataFrame, weights: pd.Series) -> None:
@@ -1420,7 +1631,7 @@ def render_monte_carlo_lab(base_returns: pd.DataFrame, weights: pd.Series) -> No
     dd_limit = h3.slider("Drawdown breach threshold", -0.80, -0.05, -0.30, 0.05)
     target_cagr = st.slider("Target CAGR for probability calculation", -0.20, 1.00, 0.15, 0.01)
 
-    run_mc = st.button("Run Monte Carlo", type="primary", use_container_width=True)
+    run_mc = st.button("Run Monte Carlo", type="primary", width="stretch")
     if run_mc or "last_mc_summary" in st.session_state:
         if run_mc:
             with st.spinner("Simulating composite portfolio paths…"):
@@ -1434,7 +1645,7 @@ def render_monte_carlo_lab(base_returns: pd.DataFrame, weights: pd.Series) -> No
             return
         stats = pl.monte_carlo_statistics(summary, dd_limit=float(dd_limit), cagr_target=float(target_cagr))
         st.subheader("Simulation summary")
-        st.dataframe(stats.style.format({c: "{:.4f}" for c in stats.select_dtypes("number").columns}), use_container_width=True, hide_index=True)
+        st.dataframe(stats.style.format({c: "{:.4f}" for c in stats.select_dtypes("number").columns}), width="stretch", hide_index=True)
         # Fan chart percentiles
         pct = pd.DataFrame({
             "1%": paths.quantile(0.01, axis=1),
@@ -1452,17 +1663,17 @@ def render_monte_carlo_lab(base_returns: pd.DataFrame, weights: pd.Series) -> No
         fig.add_trace(go.Scatter(x=pct.index, y=pct["25%"], fill="tonexty", name="25%-75% band", line=dict(width=0)))
         fig.add_trace(go.Scatter(x=pct.index, y=pct["Median"], name="Median"))
         fig.update_layout(title="Monte Carlo composite equity fan chart", yaxis_title="Wealth multiple")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.histogram(summary, x="CAGR", nbins=60, title="Simulated CAGR distribution"), use_container_width=True)
-        c2.plotly_chart(px.histogram(summary, x="Max Drawdown", nbins=60, title="Simulated max drawdown distribution"), use_container_width=True)
+        c1.plotly_chart(px.histogram(summary, x="CAGR", nbins=60, title="Simulated CAGR distribution"), width="stretch")
+        c2.plotly_chart(px.histogram(summary, x="Max Drawdown", nbins=60, title="Simulated max drawdown distribution"), width="stretch")
         c3, c4 = st.columns(2)
-        c3.plotly_chart(px.histogram(summary, x="Final Wealth Multiple", nbins=60, title="Final wealth multiple distribution"), use_container_width=True)
-        c4.plotly_chart(px.histogram(summary, x="Time Underwater %", nbins=60, title="Time underwater distribution"), use_container_width=True)
+        c3.plotly_chart(px.histogram(summary, x="Final Wealth Multiple", nbins=60, title="Final wealth multiple distribution"), width="stretch")
+        c4.plotly_chart(px.histogram(summary, x="Time Underwater %", nbins=60, title="Time underwater distribution"), width="stretch")
         st.subheader("Worst simulated paths")
         worst_cols = summary.sort_values("Max Drawdown").head(10).index
         worst_paths = paths.iloc[:, list(worst_cols)]
-        st.plotly_chart(px.line(worst_paths, title="Worst 10 simulated paths by max drawdown"), use_container_width=True)
+        st.plotly_chart(px.line(_downsample_timeseries(worst_paths), title="Worst 10 simulated paths by max drawdown"), width="stretch")
         st.download_button("Download Monte Carlo summary CSV", summary.to_csv(index=False).encode("utf-8"), "monte_carlo_summary.csv", "text/csv")
         # Limit path export if huge; still useful.
         st.download_button("Download Monte Carlo paths CSV", paths.to_csv().encode("utf-8"), "monte_carlo_paths.csv", "text/csv")
@@ -1485,42 +1696,42 @@ def render_correlation_requirement_lab(base_returns: pd.DataFrame, weights: pd.S
         return
     req = dl.marginal_correlation_requirements(base_returns, weights)
     st.subheader("Strategy-to-portfolio correlation requirements")
-    st.dataframe(req.style.format({c: "{:.3f}" for c in req.select_dtypes("number").columns}), use_container_width=True, hide_index=True)
+    st.dataframe(req.style.format({c: "{:.3f}" for c in req.select_dtypes("number").columns}), width="stretch", hide_index=True)
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.scatter(req, x="Corr to Portfolio", y="Max Corr for Sharpe Accretion", color="Decision", size="Weight", hover_name="Strategy", title="Current correlation vs max Sharpe-accretive correlation"), use_container_width=True)
-    c2.plotly_chart(px.bar(req.sort_values("Sharpe Corr Safety"), x="Strategy", y="Sharpe Corr Safety", color="Decision", title="Sharpe correlation safety margin"), use_container_width=True)
+    c1.plotly_chart(px.scatter(req, x="Corr to Portfolio", y="Max Corr for Sharpe Accretion", color="Decision", size="Weight", hover_name="Strategy", title="Current correlation vs max Sharpe-accretive correlation"), width="stretch")
+    c2.plotly_chart(px.bar(req.sort_values("Sharpe Corr Safety"), x="Strategy", y="Sharpe Corr Safety", color="Decision", title="Sharpe correlation safety margin"), width="stretch")
     c3, c4 = st.columns(2)
-    c3.plotly_chart(px.bar(req.sort_values("Tail Corr to Portfolio", ascending=False), x="Strategy", y="Tail Corr to Portfolio", color="Decision", title="Tail correlation to active portfolio"), use_container_width=True)
-    c4.plotly_chart(px.bar(req.sort_values("Vol Corr Safety"), x="Strategy", y="Vol Corr Safety", color="Decision", title="Volatility-reduction correlation safety"), use_container_width=True)
+    c3.plotly_chart(px.bar(req.sort_values("Tail Corr to Portfolio", ascending=False), x="Strategy", y="Tail Corr to Portfolio", color="Decision", title="Tail correlation to active portfolio"), width="stretch")
+    c4.plotly_chart(px.bar(req.sort_values("Vol Corr Safety"), x="Strategy", y="Vol Corr Safety", color="Decision", title="Volatility-reduction correlation safety"), width="stretch")
 
     corr, required, safety = dl.pairwise_required_correlation(base_returns)
     st.subheader("Pairwise required correlation matrices")
     a, b, c = st.columns(3)
-    a.plotly_chart(px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Observed correlation"), use_container_width=True)
-    b.plotly_chart(px.imshow(required, text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Approx max useful correlation"), use_container_width=True)
-    c.plotly_chart(px.imshow(safety, text_auto=".2f", color_continuous_scale="RdYlGn", title="Correlation safety margin"), use_container_width=True)
+    a.plotly_chart(px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Observed correlation"), width="stretch")
+    b.plotly_chart(px.imshow(required, text_auto=".2f", zmin=-1, zmax=1, color_continuous_scale="RdBu_r", title="Approx max useful correlation"), width="stretch")
+    c.plotly_chart(px.imshow(safety, text_auto=".2f", color_continuous_scale="RdYlGn", title="Correlation safety margin"), width="stretch")
     danger = safety.where(~np.eye(len(safety), dtype=bool)).stack().reset_index()
     danger.columns = ["Strategy A", "Strategy B", "Safety Margin"]
     danger = danger.sort_values("Safety Margin").head(20)
     st.subheader("Most dangerous correlation pairs")
-    display_readable_table(danger, use_container_width=True, hide_index=True)
-    st.plotly_chart(px.bar(danger, x="Strategy A", y="Safety Margin", color="Strategy B", title="Pairs closest to / above required correlation limits"), use_container_width=True)
+    display_readable_table(danger, width="stretch", hide_index=True)
+    st.plotly_chart(px.bar(danger, x="Strategy A", y="Safety Margin", color="Strategy B", title="Pairs closest to / above required correlation limits"), width="stretch")
 
     st.subheader("Portfolio-level correlation breakpoints")
     dd_threshold = st.slider("Max drawdown failure threshold", -0.80, -0.05, -0.30, 0.05, key="corr_req_dd")
     sharpe_threshold = st.slider("Minimum acceptable Sharpe", -1.0, 5.0, 1.0, 0.1, key="corr_req_sharpe")
     curve = dl.correlation_breakpoint_curve(base_returns, weights)
     if not curve.empty:
-        display_readable_table(curve, use_container_width=True, hide_index=True)
+        display_readable_table(curve, width="stretch", hide_index=True)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=curve["Avg Pairwise Corr"], y=curve["Max Drawdown"], name="Max Drawdown"))
         fig.add_trace(go.Scatter(x=curve["Avg Pairwise Corr"], y=curve["cVaR 95"], name="cVaR 95"))
         fig.add_hline(y=dd_threshold, line_dash="dash", annotation_text="DD threshold")
         fig.update_layout(title="How portfolio risk changes as correlations rise", xaxis_title="Average stressed pairwise correlation")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.line(curve, x="Avg Pairwise Corr", y="Sharpe", title="Sharpe as correlations rise"), use_container_width=True)
-        c2.plotly_chart(px.line(curve, x="Avg Pairwise Corr", y="Volatility", title="Volatility as correlations rise"), use_container_width=True)
+        c1.plotly_chart(px.line(curve, x="Avg Pairwise Corr", y="Sharpe", title="Sharpe as correlations rise"), width="stretch")
+        c2.plotly_chart(px.line(curve, x="Avg Pairwise Corr", y="Volatility", title="Volatility as correlations rise"), width="stretch")
         fail_dd = curve[curve["Max Drawdown"] < dd_threshold]
         fail_sh = curve[curve["Sharpe"] < sharpe_threshold]
         msg = []
@@ -1555,13 +1766,13 @@ def render_efficient_frontier_lab(base_returns: pd.DataFrame, weights: pd.Series
     eff = pts[pts["Efficient"]].sort_values("Volatility")
     fig.add_trace(go.Scatter(x=eff["Volatility"], y=eff["CAGR"], mode="lines", name="Approx efficient frontier", line=dict(width=4)))
     fig.add_trace(go.Scatter(x=[active.get("Volatility")], y=[active.get("CAGR")], mode="markers", name="Active portfolio", marker=dict(size=16, symbol="star")))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     long = dl.allocation_frontier_by_return(pts, wdf)
     if not long.empty:
-        st.plotly_chart(px.area(long, x="CAGR", y="Weight", color="Strategy", title="Strategy allocations along the frontier"), use_container_width=True)
+        st.plotly_chart(px.area(long, x="CAGR", y="Weight", color="Strategy", title="Strategy allocations along the frontier"), width="stretch")
     st.subheader("Frontier table")
     display = pts.sort_values(["Efficient", "CAGR"], ascending=[False, False]).head(100)
-    display_readable_table(display, use_container_width=True, hide_index=True)
+    display_readable_table(display, width="stretch", hide_index=True)
     st.download_button("Download random portfolio cloud CSV", pts.to_csv(index=False).encode("utf-8"), "efficient_frontier_cloud.csv", "text/csv")
     if not long.empty:
         st.download_button("Download frontier allocations CSV", long.to_csv(index=False).encode("utf-8"), "frontier_allocations.csv", "text/csv")
@@ -1580,17 +1791,17 @@ def render_robustness_lab(base_returns: pd.DataFrame) -> None:
         st.warning("Not enough period data for robustness analysis.")
         return
     st.subheader("Year-by-year optimizer performance")
-    display_readable_table(metrics, use_container_width=True, hide_index=True)
+    display_readable_table(metrics, width="stretch", hide_index=True)
     c1, c2 = st.columns(2)
-    c1.plotly_chart(px.bar(metrics, x="Period", y="Sharpe", color="Portfolio", barmode="group", title="Sharpe by year and optimizer"), use_container_width=True)
-    c2.plotly_chart(px.bar(metrics, x="Period", y="Max Drawdown", color="Portfolio", barmode="group", title="Max drawdown by year and optimizer"), use_container_width=True)
+    c1.plotly_chart(px.bar(metrics, x="Period", y="Sharpe", color="Portfolio", barmode="group", title="Sharpe by year and optimizer"), width="stretch")
+    c2.plotly_chart(px.bar(metrics, x="Period", y="Max Drawdown", color="Portfolio", barmode="group", title="Max drawdown by year and optimizer"), width="stretch")
     if not weights.empty:
         st.subheader("Allocation stability")
         port = st.selectbox("Optimizer for allocation stability", sorted(weights["Portfolio"].unique()))
         sub = weights[weights["Portfolio"] == port]
-        st.plotly_chart(px.bar(sub, x="Period", y="Weight", color="Strategy", title=f"Allocation stability: {port}"), use_container_width=True)
+        st.plotly_chart(px.bar(sub, x="Period", y="Weight", color="Strategy", title=f"Allocation stability: {port}"), width="stretch")
         stability = sub.groupby("Strategy")["Weight"].agg(["mean", "std", "min", "max"]).sort_values("mean", ascending=False)
-        display_readable_table(stability, use_container_width=True)
+        display_readable_table(stability, width="stretch")
         st.download_button("Download robustness weights CSV", weights.to_csv(index=False).encode("utf-8"), "robustness_weights.csv", "text/csv")
     st.download_button("Download robustness metrics CSV", metrics.to_csv(index=False).encode("utf-8"), "robustness_metrics.csv", "text/csv")
     st.session_state["last_robustness_metrics"] = metrics
@@ -1614,7 +1825,7 @@ def render_portfolio_decision_page(base_returns: pd.DataFrame, weights: pd.Serie
         m["Concentration HHI"] = float((w ** 2).sum())
         metrics_rows.append(m)
     metrics = pd.DataFrame(metrics_rows).set_index("Portfolio") if metrics_rows else pd.DataFrame()
-    run = st.button("Run candidate Monte Carlo comparison", type="primary", use_container_width=True)
+    run = st.button("Run candidate Monte Carlo comparison", type="primary", width="stretch")
     if run or "last_candidate_mc" in st.session_state:
         if run:
             with st.spinner("Running Monte Carlo across candidate portfolios…"):
@@ -1633,24 +1844,24 @@ def render_portfolio_decision_page(base_returns: pd.DataFrame, weights: pd.Serie
     decision = dl.final_decision_table(metrics, corr_req, breakpoints, mc if not mc.empty else None, corr_safety_by_candidate=corr_safety, conservativeness=float(conservativeness))
     st.session_state["last_decision_table"] = decision
     st.subheader("Final decision table")
-    display_readable_table(decision, use_container_width=True)
+    display_readable_table(decision, width="stretch")
     if not decision.empty:
         top = decision.index[0]
         st.success(f"Current best candidate under the selected assumptions: **{top}**. This is a recommendation under model assumptions, not a guarantee.")
         fig = px.bar(decision.reset_index(), x="Portfolio", y=["Return Score", "Risk Score", "Risk-Adjusted Score", "MC Downside Score", "Correlation Safety Backdrop"], title="Decision score components", barmode="group")
-        st.plotly_chart(fig, use_container_width=True)
-        st.plotly_chart(px.bar(decision.reset_index(), x="Portfolio", y="Final Score", color="Decision", title="Final score ranking"), use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(px.bar(decision.reset_index(), x="Portfolio", y="Final Score", color="Decision", title="Final score ranking"), width="stretch")
     if not mc.empty:
         st.subheader("Candidate Monte Carlo comparison")
-        display_readable_table(mc, use_container_width=True)
+        display_readable_table(mc, width="stretch")
         mcf = mc.reset_index()
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.scatter(mcf, x="5% Max DD", y="Median CAGR", size="Median Final Wealth", hover_name="Portfolio", title="MC downside vs median CAGR"), use_container_width=True)
-        c2.plotly_chart(px.bar(mcf.sort_values("5% CAGR", ascending=False), x="Portfolio", y="5% CAGR", title="Monte Carlo 5% CAGR by candidate"), use_container_width=True)
+        c1.plotly_chart(px.scatter(mcf, x="5% Max DD", y="Median CAGR", size="Median Final Wealth", hover_name="Portfolio", title="MC downside vs median CAGR"), width="stretch")
+        c2.plotly_chart(px.bar(mcf.sort_values("5% CAGR", ascending=False), x="Portfolio", y="5% CAGR", title="Monte Carlo 5% CAGR by candidate"), width="stretch")
     sheets = {"Decision": decision, "Historical Metrics": metrics, "MC Comparison": mc, "Correlation Requirements": corr_req, "Breakpoints": breakpoints}
     try:
         xbytes = dl.excel_workbook_bytes(sheets)
-        st.download_button("Download portfolio decision workbook XLSX", xbytes, file_name="portfolio_decision_workbook.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("Download portfolio decision workbook XLSX", xbytes, file_name="portfolio_decision_workbook.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
     except Exception as exc:
         st.warning(f"Excel export unavailable: {exc}")
 
@@ -1687,7 +1898,7 @@ def render_benchmark_factor_page(returns_df: pd.DataFrame, native_benchmarks: pd
     fig.add_trace(go.Scatter(x=roll_beta.index, y=roll_beta, name="Rolling beta"))
     fig.add_trace(go.Scatter(x=roll_corr.index, y=roll_corr, name="Rolling correlation"))
     fig.update_layout(title=f"Rolling market relationship: {strat} vs {bench}")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     factors = st.multiselect("Factor benchmark columns", factor_df.columns, default=[bench])
     if factors:
         coeffs, stats_dict = ap.factor_regression(returns_df[strat], factor_df[factors])
@@ -1696,11 +1907,11 @@ def render_benchmark_factor_page(returns_df: pd.DataFrame, native_benchmarks: pd
             m1.metric("Regression R²", f"{stats_dict.get('R2', np.nan):.2%}")
             m2.metric("Residual vol", f"{stats_dict.get('Residual Vol', np.nan):.2%}")
             m3.metric("Annual alpha", f"{stats_dict.get('Annual Alpha', np.nan):.2%}")
-            st.dataframe(coeffs.style.format("{:.6f}"), use_container_width=True)
+            st.dataframe(coeffs.style.format("{:.6f}"), width="stretch")
             coef_df = coeffs.reset_index().rename(columns={"index": "Factor"})
-            st.plotly_chart(px.bar(coef_df, x="Factor", y="Coefficient", title="Regression coefficients"), use_container_width=True)
+            st.plotly_chart(px.bar(coef_df, x="Factor", y="Coefficient", title="Regression coefficients"), width="stretch")
             if "T-Stat" in coef_df.columns:
-                st.plotly_chart(px.bar(coef_df, x="Factor", y="T-Stat", title="Regression t-statistics"), use_container_width=True)
+                st.plotly_chart(px.bar(coef_df, x="Factor", y="T-Stat", title="Regression t-statistics"), width="stretch")
         else:
             st.warning("Regression could not be computed with the selected factor set.")
 
@@ -1722,9 +1933,9 @@ def render_exposure_page(allocations: Dict[str, pd.DataFrame], composite_weights
     c2.metric("Top 3 weight", f"{stats_dict['Top 3']:.2%}")
     c3.metric("HHI concentration", f"{stats_dict['HHI']:.3f}")
     left, right = st.columns([1, 1])
-    left.dataframe(alloc.style.format({"Weight": "{:.2%}"}), use_container_width=True, hide_index=True)
-    right.plotly_chart(px.pie(alloc[alloc["Weight"] > 0], values="Weight", names="Ticker", title=f"Latest holdings: {strat}", hole=0.35), use_container_width=True)
-    st.plotly_chart(px.bar(alloc.sort_values("Weight", ascending=False).head(40), x="Ticker", y="Weight", title=f"Top holdings: {strat}"), use_container_width=True)
+    left.dataframe(alloc.style.format({"Weight": "{:.2%}"}), width="stretch", hide_index=True)
+    right.plotly_chart(px.pie(alloc[alloc["Weight"] > 0], values="Weight", names="Ticker", title=f"Latest holdings: {strat}", hole=0.35), width="stretch")
+    st.plotly_chart(px.bar(alloc.sort_values("Weight", ascending=False).head(40), x="Ticker", y="Weight", title=f"Top holdings: {strat}"), width="stretch")
 
     st.subheader("Composite latest exposure")
     # Map selected strategy weights to allocation names by direct name, falling back equal.
@@ -1743,9 +1954,9 @@ def render_exposure_page(allocations: Dict[str, pd.DataFrame], composite_weights
     combined_df = pd.DataFrame([{"Ticker": k, "Weight": v} for k, v in combined.items()]).sort_values("Weight", ascending=False)
     if not combined_df.empty:
         cc1, cc2 = st.columns([1, 1])
-        cc1.dataframe(combined_df.style.format({"Weight": "{:.2%}"}), use_container_width=True, hide_index=True)
-        cc2.plotly_chart(px.pie(combined_df.head(25), names="Ticker", values="Weight", title="Composite top exposure", hole=0.35), use_container_width=True)
-        st.plotly_chart(px.bar(combined_df.head(40), x="Ticker", y="Weight", title="Composite top holdings"), use_container_width=True)
+        cc1.dataframe(combined_df.style.format({"Weight": "{:.2%}"}), width="stretch", hide_index=True)
+        cc2.plotly_chart(px.pie(combined_df.head(25), names="Ticker", values="Weight", title="Composite top exposure", hole=0.35), width="stretch")
+        st.plotly_chart(px.bar(combined_df.head(40), x="Ticker", y="Weight", title="Composite top holdings"), width="stretch")
 
     st.subheader("Holdings overlap matrix")
     tickers = sorted({t for df in allocations.values() if not df.empty for t in df["Ticker"].tolist()})
@@ -1760,7 +1971,7 @@ def render_exposure_page(allocations: Dict[str, pd.DataFrame], composite_weights
         for a in names:
             for b in names:
                 overlap.loc[a, b] = float(np.minimum(mat.loc[a], mat.loc[b]).sum())
-        st.plotly_chart(px.imshow(overlap, text_auto=".2f", color_continuous_scale="Blues", title="Holdings overlap by weight"), use_container_width=True)
+        st.plotly_chart(px.imshow(overlap, text_auto=".2f", color_continuous_scale="Blues", title="Holdings overlap by weight"), width="stretch")
 
     st.subheader("Optional holdings risk contribution")
     risk_csv = st.file_uploader("Optional asset returns/prices CSV", type=["csv"], key="risk_asset_csv_v3")
@@ -1772,8 +1983,8 @@ def render_exposure_page(allocations: Dict[str, pd.DataFrame], composite_weights
             rc = ap.holdings_risk_contribution(alloc.set_index("Ticker")["Weight"], asset_rets)
             if not rc.empty:
                 rc_df = rc.rename("Risk Contribution").reset_index().rename(columns={"index": "Ticker"})
-                st.dataframe(rc_df.style.format({"Risk Contribution": "{:.2%}"}), use_container_width=True, hide_index=True)
-                st.plotly_chart(px.bar(rc_df, x="Ticker", y="Risk Contribution", title="Holdings risk contribution"), use_container_width=True)
+                st.dataframe(rc_df.style.format({"Risk Contribution": "{:.2%}"}), width="stretch", hide_index=True)
+                st.plotly_chart(px.bar(rc_df, x="Ticker", y="Risk Contribution", title="Holdings risk contribution"), width="stretch")
             else:
                 st.warning("No overlap between allocation tickers and uploaded asset columns.")
 
@@ -1818,11 +2029,11 @@ def render_research_report(returns_df: pd.DataFrame, allocations: Dict[str, pd.D
 
     # Downloadable CSVs first, so the page is useful even if HTML rendering is slow.
     c0, c1, c2 = st.columns(3)
-    c0.download_button("Download active portfolio weights CSV", wdf.to_csv(index=False).encode("utf-8"), file_name="active_portfolio_weights.csv", mime="text/csv", use_container_width=True)
+    c0.download_button("Download active portfolio weights CSV", wdf.to_csv(index=False).encode("utf-8"), file_name="active_portfolio_weights.csv", mime="text/csv", width="stretch")
     active = pl.portfolio_returns(base_returns, weights, "Composite Portfolio")
-    c1.download_button("Download active composite returns CSV", active.to_csv().encode("utf-8"), file_name="composite_portfolio_returns.csv", mime="text/csv", use_container_width=True)
+    c1.download_button("Download active composite returns CSV", active.to_csv().encode("utf-8"), file_name="composite_portfolio_returns.csv", mime="text/csv", width="stretch")
     if not candidate_metrics.empty:
-        c2.download_button("Download candidate metrics CSV", candidate_metrics.to_csv().encode("utf-8"), file_name="portfolio_candidate_metrics.csv", mime="text/csv", use_container_width=True)
+        c2.download_button("Download candidate metrics CSV", candidate_metrics.to_csv().encode("utf-8"), file_name="portfolio_candidate_metrics.csv", mime="text/csv", width="stretch")
 
     css = """
     <style>
@@ -1918,7 +2129,7 @@ def render_research_report(returns_df: pd.DataFrame, allocations: Dict[str, pd.D
     parts.append("</body></html>")
     html = "\n".join(parts)
 
-    st.download_button("Download full research memo HTML", html.encode("utf-8"), file_name="portfolio_research_memo.html", mime="text/html", use_container_width=True)
+    st.download_button("Download full research memo HTML", html.encode("utf-8"), file_name="portfolio_research_memo.html", mime="text/html", width="stretch")
     sheets = {
         "Metrics": summary,
         "Weights": wdf,
@@ -1934,7 +2145,7 @@ def render_research_report(returns_df: pd.DataFrame, allocations: Dict[str, pd.D
         "Robustness Weights": st.session_state.get("last_robustness_weights", pd.DataFrame()),
     }
     try:
-        st.download_button("Download formatted research workbook XLSX", dl.excel_workbook_bytes(sheets), file_name="portfolio_research_workbook.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("Download formatted research workbook XLSX", dl.excel_workbook_bytes(sheets), file_name="portfolio_research_workbook.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
     except Exception as exc:
         st.warning(f"Workbook export failed: {exc}")
     components.html(html, height=1100, scrolling=True)
@@ -1948,12 +2159,30 @@ def render_analytics_suite(run: BacktestRun) -> None:
         return
 
     st.header("Research Workbench")
+    available_strategy_cols = list(raw_returns.columns)
+    saved_workbench_cols = st.session_state.get("workbench_strategy_filter", available_strategy_cols)
+    default_workbench_cols = [c for c in saved_workbench_cols if c in available_strategy_cols] or available_strategy_cols
+    selected_workbench_cols = st.multiselect(
+        "Strategies included in this analysis session",
+        available_strategy_cols,
+        default=default_workbench_cols,
+        help="Use this to remove strategies from the workbench analysis without deleting their generated output files or rerunning the backtest.",
+    )
+    if not selected_workbench_cols:
+        st.warning("Select at least one strategy for the workbench analysis.")
+        return
+    st.session_state["workbench_strategy_filter"] = selected_workbench_cols
+    raw_returns = raw_returns[selected_workbench_cols]
+    native_benchmarks = native_benchmarks[[c for c in native_benchmarks.columns if any(strat in c for strat in selected_workbench_cols)]] if not native_benchmarks.empty else native_benchmarks
+    allocations = {k: v for k, v in allocations.items() if k in selected_workbench_cols}
+
     align_mode = st.radio("Return alignment", ["Common overlap only", "Native inception dates", "Full history with cash for missing"], horizontal=True)
     aligned_returns = ap.align_returns(raw_returns, align_mode).dropna(how="all")
     if aligned_returns.empty:
         st.warning("The selected alignment mode left no usable return data.")
         return
     universes = render_data_universe_panel(aligned_returns)
+    curve_display_controls()
     analysis_returns = _safe_universe(universes.get("analysis"), aligned_returns)
     optimization_returns = _safe_universe(universes.get("optimization"), analysis_returns)
     validation_returns = _safe_universe(universes.get("validation"), analysis_returns)
@@ -1972,29 +2201,44 @@ def render_analytics_suite(run: BacktestRun) -> None:
     with st.expander("Active portfolio weights", expanded=False):
         awdf = pd.DataFrame({"Strategy": active_weights.index, "Weight": active_weights.values}).sort_values("Weight", ascending=False)
         caw1, caw2 = st.columns([1, 1])
-        caw1.dataframe(readable_styler(awdf), use_container_width=True, hide_index=True)
-        caw2.plotly_chart(px.pie(awdf, names="Strategy", values="Weight", title="Active portfolio weights"), use_container_width=True)
+        caw1.dataframe(readable_styler(awdf), width="stretch", hide_index=True)
+        caw2.plotly_chart(px.pie(awdf, names="Strategy", values="Weight", title="Active portfolio weights"), width="stretch")
 
     if nav == "Performance":
-        summary = ap.perf_summary(returns_df)
+        perf_options = list(returns_df.columns)
+        saved_perf_cols = st.session_state.get("performance_visible_columns", perf_options)
+        default_perf_cols = [c for c in saved_perf_cols if c in perf_options] or perf_options
+        visible_perf_cols = st.multiselect(
+            "Strategies / portfolios shown in the Performance overview",
+            perf_options,
+            default=default_perf_cols,
+            help="Display-only filter for cleaner tables/charts and screenshots. It does not change Portfolio Lab candidates.",
+        )
+        if not visible_perf_cols:
+            st.warning("Select at least one strategy or portfolio to display.")
+            return
+        st.session_state["performance_visible_columns"] = visible_perf_cols
+        perf_returns = returns_df[visible_perf_cols]
+        summary = ap.perf_summary(perf_returns)
         if not summary.empty:
-            display_readable_table(summary, use_container_width=True)
+            display_readable_table(summary, width="stretch")
             render_visual_metric_companions(summary)
         c1, c2 = st.columns(2)
-        c1.plotly_chart(px.line((1 + returns_df.fillna(0)).cumprod(), title="Equity curves", log_y=True), use_container_width=True)
-        fig_dd = px.line(ap.drawdowns(returns_df), title="Drawdowns")
+        c1.plotly_chart(px.line(curve_from_returns(perf_returns, "performance_equity_tf", "Equity timeframe"), title="Equity curves", log_y=True), width="stretch")
+        fig_dd = px.line(drawdown_from_returns(perf_returns, "performance_drawdown_tf", "Drawdown timeframe"), title="Drawdowns")
         fig_dd.update_layout(yaxis_tickformat=".0%")
-        c2.plotly_chart(fig_dd, use_container_width=True)
-        if returns_df.shape[1] > 1:
-            div = ap.diversification_metrics(base_returns)
+        c2.plotly_chart(fig_dd, width="stretch")
+        div_base = base_returns[[c for c in visible_perf_cols if c in base_returns.columns]]
+        if div_base.shape[1] > 1:
+            div = ap.diversification_metrics(div_base)
             cols = st.columns(len(div))
             for col, (k, v) in zip(cols, div.items()):
                 col.metric(k, f"{v:.3f}" if pd.notna(v) else "n/a")
         st.subheader("Rolling metrics")
         window = st.slider("Rolling window", 21, 504, 63, key="roll_metrics_window_v3")
-        metric_dict = ap.rolling_metrics(returns_df, window=window)
+        metric_dict = ap.rolling_metrics(perf_returns, window=window)
         metric_name = st.selectbox("Metric", list(metric_dict.keys()))
-        st.plotly_chart(px.line(metric_dict[metric_name], title=f"{metric_name} ({window} trading days)"), use_container_width=True)
+        st.plotly_chart(px.line(sliced_timeseries(metric_dict[metric_name], "rolling_metric_tf", "Rolling-metric timeframe"), title=f"{metric_name} ({window} trading days)"), width="stretch")
 
     elif nav == "Portfolio Lab":
         render_portfolio_lab(base_returns, optimization_returns, validation_returns, universe_labels)
@@ -2030,16 +2274,16 @@ def render_analytics_suite(run: BacktestRun) -> None:
         if not tdd.empty:
             show = tdd.copy()
             show["Depth"] = show["Depth"].map(lambda x: f"{x:.2%}")
-            st.dataframe(show, use_container_width=True, hide_index=True)
-            st.plotly_chart(px.bar(tdd, x="Start", y="Depth", title=f"Top drawdowns: {strat}"), use_container_width=True)
+            st.dataframe(show, width="stretch", hide_index=True)
+            st.plotly_chart(px.bar(tdd, x="Start", y="Depth", title=f"Top drawdowns: {strat}"), width="stretch")
         c1, c2 = st.columns(2)
         monthly = ap.monthly_returns_table(returns_df[strat])
         if not monthly.empty:
-            c1.plotly_chart(px.imshow(monthly, text_auto=".1%", color_continuous_scale="RdYlGn", aspect="auto", title="Monthly return heatmap"), use_container_width=True)
+            c1.plotly_chart(px.imshow(monthly, text_auto=".1%", color_continuous_scale="RdYlGn", aspect="auto", title="Monthly return heatmap"), width="stretch")
         yearly = ap.yearly_returns(returns_df[strat])
         if not yearly.empty:
-            c2.plotly_chart(px.bar(yearly, title="Yearly returns"), use_container_width=True)
-        st.plotly_chart(px.line(ap.drawdowns(returns_df[[strat]]), title="Underwater plot"), use_container_width=True)
+            c2.plotly_chart(px.bar(yearly, title="Yearly returns"), width="stretch")
+        st.plotly_chart(px.line(drawdown_from_returns(returns_df[[strat]], "single_underwater_tf", "Underwater plot timeframe"), title="Underwater plot"), width="stretch")
 
     elif nav == "Reports & Downloads":
         render_research_report(returns_df, allocations, base_returns, active_weights, universe_labels)
@@ -2090,7 +2334,7 @@ def main() -> None:
 
     if input_mode == "Analyze existing output ZIP":
         zip_file = st.file_uploader("Upload prior output ZIP", type=["zip"])
-        if zip_file is not None and st.button("Load output ZIP", type="primary", use_container_width=True):
+        if zip_file is not None and st.button("Load output ZIP", type="primary", width="stretch"):
             run = analyze_existing_zip(zip_file)
             st.session_state["last_run"] = run
         run = st.session_state.get("last_run")
@@ -2098,9 +2342,41 @@ def main() -> None:
             st.info("Upload an output ZIP generated by this app to analyze it without rerunning backtests.")
             st.stop()
     else:
-        uploaded_files = st.file_uploader("Upload Quantmage JSON file(s)", type=["json"], accept_multiple_files=True)
-        if not uploaded_files:
-            st.info("Upload one or more Quantmage JSON exports or single strategy JSON files to begin.")
+        st.markdown("#### JSON working pool")
+        st.caption("Add JSONs in batches, remove individual files, and run only the current working pool. The pool persists while the Streamlit session is alive.")
+        uploader_nonce = int(st.session_state.get("json_pool_uploader_nonce", 0))
+        uploaded_files = st.file_uploader(
+            "Add Quantmage JSON file(s) to working pool",
+            type=["json"],
+            accept_multiple_files=True,
+            key=f"json_pool_uploader_{uploader_nonce}",
+        )
+        pool = get_json_pool()
+        if uploaded_files:
+            if st.button("Add uploaded JSONs to pool", width="stretch"):
+                added = 0
+                for uploaded in uploaded_files:
+                    raw = uploaded.getvalue()
+                    payload, error = parse_uploaded_json(raw)
+                    if error:
+                        st.error(f"{uploaded.name}: {error}")
+                        continue
+                    fid = json_pool_id(uploaded.name, raw)
+                    pool[fid] = {
+                        "name": uploaded.name,
+                        "display": json_pool_display_name(uploaded.name, raw),
+                        "bytes": raw,
+                        "payload": payload,
+                        "size": len(raw),
+                        "added_at": time.time(),
+                    }
+                    added += 1
+                st.session_state["json_pool_uploader_nonce"] = uploader_nonce + 1
+                st.success(f"Added/updated {added} JSON file(s) in the working pool.")
+                st.rerun()
+
+        if not pool:
+            st.info("Upload one or more Quantmage JSON exports, click **Add uploaded JSONs to pool**, then run the batch.")
             with st.expander("What this app produces"):
                 st.markdown("""
                 Each run creates downloadable outputs:
@@ -2113,16 +2389,44 @@ def main() -> None:
                 """)
             st.stop()
 
+        pool_rows = []
+        for fid, rec in pool.items():
+            pool_rows.append({
+                "ID": fid,
+                "File": rec.get("display") or rec.get("name") or fid,
+                "Size": human_size(int(rec.get("size", 0))),
+            })
+        pool_df = pd.DataFrame(pool_rows).sort_values("File")
+        st.dataframe(pool_df[["File", "Size"]], width="stretch", hide_index=True)
+        remove_options = pool_df["ID"].tolist()
+        remove_ids = st.multiselect(
+            "Remove JSONs from working pool",
+            remove_options,
+            format_func=lambda fid: str(pool.get(fid, {}).get("display") or pool.get(fid, {}).get("name") or fid),
+        )
+        r1, r2 = st.columns(2)
+        if r1.button("Remove selected JSONs", disabled=not remove_ids, width="stretch"):
+            for fid in remove_ids:
+                pool.pop(fid, None)
+            st.rerun()
+        if r2.button("Clear JSON pool", width="stretch"):
+            pool.clear()
+            st.session_state["json_pool_uploader_nonce"] = uploader_nonce + 1
+            st.rerun()
+
         uploaded_payloads: List[Tuple[str, bytes, Any]] = []
         previews: List[pd.DataFrame] = []
-        for uploaded in uploaded_files:
-            raw = uploaded.getvalue()
-            payload, error = parse_uploaded_json(raw)
-            if error:
-                st.error(f"{uploaded.name}: {error}")
-                st.stop()
-            uploaded_payloads.append((uploaded.name, raw, payload))
-            previews.append(extract_strategy_preview(payload, source_name=uploaded.name))
+        for fid, rec in sorted(pool.items(), key=lambda kv: str(kv[1].get("display") or kv[0])):
+            display_name = str(rec.get("display") or rec.get("name") or fid)
+            raw = rec.get("bytes", b"")
+            payload = rec.get("payload")
+            if payload is None:
+                payload, error = parse_uploaded_json(raw)
+                if error:
+                    st.error(f"{display_name}: {error}")
+                    continue
+            uploaded_payloads.append((display_name, raw, payload))
+            previews.append(extract_strategy_preview(payload, source_name=display_name))
 
         preview_df = pd.concat([df for df in previews if not df.empty], ignore_index=True) if previews else pd.DataFrame()
         selected_keys: List[str] = []
@@ -2139,20 +2443,30 @@ def main() -> None:
             selected_labels = st.multiselect("Strategies to run", labels, default=labels)
             selected_keys = [key_by_label[x] for x in selected_labels]
             display_cols = ["#", "source", "name", "path", "depth", "benchmark", "trading_type", "rebalance"]
-            st.dataframe(shown[display_cols], use_container_width=True, hide_index=True)
+            st.dataframe(shown[display_cols], width="stretch", hide_index=True)
             st.caption(f"Selected {len(selected_keys)} of {len(preview_df)} detected strategy object(s).")
 
         if parallel_strategy_level and len(selected_keys) > 1:
             st.success(f"Parallel strategy mode is on. The app will create up to {int(max_workers)} concurrent worker(s).")
-        elif len(uploaded_files) > 1:
-            st.info("Multiple uploads will be processed as a batch. Turn on strategy-level parallelism for concurrent execution.")
+        elif len(uploaded_payloads) > 1:
+            st.info("Multiple JSONs in the working pool will be processed as a batch. Turn on strategy-level parallelism for concurrent execution.")
 
-        run_button = st.button("Run backtest batch", type="primary", use_container_width=True)
+        merge_with_existing = False
+        previous_run = st.session_state.get("last_run")
+        if previous_run is not None:
+            merge_with_existing = st.checkbox(
+                "Merge this run into the existing output set instead of replacing it",
+                value=True,
+                help="Useful when adding new JSONs: run only the new/selected strategies and keep already-generated outputs for analysis.",
+            )
+        run_button = st.button("Run backtest batch", type="primary", width="stretch")
         if run_button:
             with st.status("Running backtest engine…", expanded=True) as status:
                 progress = st.progress(0.0, text="Starting backtest tasks…")
                 try:
                     run = run_backtest_batch(uploaded_payloads, benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, int(timeout_sec), int(retries), cookie, token, bool(refresh_sim_cache), parallel_strategy_level, int(max_workers), selected_strategy_keys=selected_keys if selected_keys else None, progress_placeholder=progress)
+                    if merge_with_existing and previous_run is not None:
+                        run = merge_backtest_runs(previous_run, run)
                     st.session_state["last_run"] = run
                     status.update(label="Backtest batch complete" if run.returncode == 0 else "Backtest batch finished with warnings/errors", state="complete" if run.returncode == 0 else "error")
                 except Exception as exc:
