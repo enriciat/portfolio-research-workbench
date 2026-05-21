@@ -195,6 +195,13 @@ class DataStore:
         "VBK": "VBKSIM",
         "IWC": "IWCSIM",
         "BND": "BNDSIM",
+        "VCIT": "VCITSIM",
+        "STIP": "STIPSIM",
+        "LTPZ": "LTPZSIM",
+        "NTSD": "NTSDSIM",
+        "UDN": "UDNSIM",
+        "BTAL": "BTALSIM",
+        "FNGD": "FNGUSIM",
         "VNQ": "REITSIM",
     })
     symbol_proxy_map: Dict[str, str] = field(default_factory=lambda: {
@@ -203,7 +210,7 @@ class DataStore:
         "VXUS": "VTI",
         "VEA": "VTI",
         "VWO": "VTI",
-        "EFA": "VTI",
+        "EFA": "EFASIM",
         "EEM": "VTI",
         "FXI": "VTI",
         "EWJ": "VTI",
@@ -211,13 +218,13 @@ class DataStore:
         "IEV": "VTI",
         "SCHF": "VTI",
         "DGRO": "VTI",
-        "USMV": "SPY",
+        "USMV": "USMVSIM",
         "SPLV": "SPY",
         "SPHQ": "SPY",
         "QUAL": "SPY",
         "RSP": "SPY",
         "SIZE": "SPY",
-        "MTUM": "QQQ",
+        "MTUM": "MTUMSIM",
         "SCHD": "VTV",
         "RPV": "VTV",
         "SMH": "SOXX",
@@ -1111,11 +1118,18 @@ class DataStore:
         if synthetic is None:
             return direct
 
+        # If the LETF map points at a Testfolio SIM underlying, use that SIM-based
+        # return stream as the authoritative source.  Mixing a SIM prehistory with
+        # live ETF prices by median scaling can create artificial stitch jumps
+        # around ETF inception (seen for QQQ/SVIX and potentially others).
+        if underlying.endswith("SIM"):
+            return synthetic
+
         if direct is None:
             return synthetic
         # Scale-align synthetic LETF history to the direct series before filling
         # any gaps. This avoids large nominal jumps when direct history ends
-        # or has holes inside the live range.
+        # or has holes inside the live range for non-SIM synthetic extensions.
         return self._merge_fill_missing(symbol, direct, synthetic)
 
     def _extend_with_stitch_map(self, symbol: str, base: Optional[PriceSeries]) -> Optional[PriceSeries]:
@@ -1209,6 +1223,17 @@ class DataStore:
                 if s is not None:
                     self.series_cache[symbol] = s
                 return s
+
+            # SIM symbols are authoritative when present in the wide Testfolio SIM
+            # cache. Prefer them over stale/ext_letf .dat stitches, which can
+            # contain older scaled versions and create artificial bumps.
+            if symbol.endswith("SIM"):
+                sim_direct = self._fetch_external_csv_history(symbol)
+                if sim_direct is None:
+                    sim_direct = self._fetch_testfolio_sim_history(symbol)
+                if sim_direct is not None:
+                    self.series_cache[symbol] = sim_direct
+                    return sim_direct
 
             direct = self._load_direct_symbol(symbol)
             merged = self._extend_with_letf_map(symbol, direct)
