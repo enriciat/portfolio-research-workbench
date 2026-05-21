@@ -1139,12 +1139,69 @@ class DataStore:
         proxy_series = self.load_symbol(proxy)
         if proxy_series is None:
             return base
-        merged = self._merge_fill_missing(symbol, base, proxy_series)
+        merged = self._merge_with_proxy_returns(symbol, base, proxy_series)
         proxy_first = proxy_series.first_index()
         base_first = base.first_index() if base is not None else None
         if merged is not None and proxy_first is not None and (base_first is None or proxy_first < base_first):
             self.proxied_symbols[symbol] = proxy
         return merged
+
+    def _merge_with_proxy_returns(
+        self,
+        symbol: str,
+        base: Optional[PriceSeries],
+        proxy: Optional[PriceSeries],
+    ) -> Optional[PriceSeries]:
+        """Fill missing stitched history using proxy returns, not proxy levels.
+
+        Level-based scaling is fragile when the proxy and base series have very
+        different nominal levels or when the proxy itself is stitched.  SVXY is
+        the important example: the old path backfilled pre-SVIX history from
+        ``UVXY?L=-0.5`` using a median level ratio and produced a huge artificial
+        step at the first SVIX/SVIXSIM date.  Chaining proxy returns backward
+        from the first real/base observation preserves continuity at the stitch
+        boundary while keeping the same return information.
+        """
+        if proxy is None:
+            return base
+        if base is None:
+            return PriceSeries(symbol=symbol, values=list(proxy.values))
+
+        vals = list(base.values)
+        base_first = base.first_index()
+        proxy_first = proxy.first_index()
+        if base_first is None:
+            return PriceSeries(symbol=symbol, values=list(proxy.values))
+        if proxy_first is None:
+            return base
+
+        # Backfill pre-base history by walking backward from the first base
+        # value.  This guarantees no level discontinuity at the stitch date.
+        for i in range(base_first - 1, proxy_first - 1, -1):
+            next_val = vals[i + 1]
+            p0 = proxy.values[i]
+            p1 = proxy.values[i + 1]
+            if next_val is None or p0 is None or p1 is None or p0 <= 0 or p1 <= 0:
+                continue
+            ratio = p1 / p0
+            if math.isfinite(ratio) and ratio > 0:
+                vals[i] = next_val / ratio
+
+        # Fill occasional holes inside/after the base range using proxy returns
+        # anchored to the most recent resolved value.
+        for i in range(base_first + 1, len(vals)):
+            if vals[i] is not None:
+                continue
+            prev_val = vals[i - 1]
+            p0 = proxy.values[i - 1]
+            p1 = proxy.values[i]
+            if prev_val is None or p0 is None or p1 is None or p0 <= 0 or p1 <= 0:
+                continue
+            ratio = p1 / p0
+            if math.isfinite(ratio) and ratio > 0:
+                vals[i] = prev_val * ratio
+
+        return PriceSeries(symbol=symbol, values=vals)
 
     def _heuristic_proxy(self, symbol: str) -> Optional[str]:
         if symbol in self.symbol_proxy_map:
