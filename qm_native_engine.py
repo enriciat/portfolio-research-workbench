@@ -667,7 +667,16 @@ class DataStore:
         if base is None:
             return extra
 
-        ratios: List[float] = []
+        # Fill gaps without creating stitch jumps.  Older versions used one
+        # global median level ratio between ``base`` and ``extra``.  That is
+        # fragile for reverse-split-heavy series such as UVXY/SVXY: the median
+        # overlap ratio can be very different from the ratio at the actual stitch
+        # boundary, producing fake jumps exactly where the history changes source.
+        # Instead, every missing point uses the nearest available overlap ratio.
+        # For prehistory this means the first common date anchors the older
+        # segment; for later gaps the closest local overlap anchors the fill.
+        overlap_idx: List[int] = []
+        overlap_ratio: List[float] = []
         for i, ev in enumerate(extra.values):
             if cutoff_idx is not None and i >= cutoff_idx:
                 continue
@@ -676,17 +685,41 @@ class DataStore:
                 continue
             r = bv / ev
             if r > 0 and math.isfinite(r):
-                ratios.append(r)
-                if len(ratios) > 2000:
-                    ratios.pop(0)
-        scale = statistics.median(ratios) if ratios else 1.0
+                overlap_idx.append(i)
+                overlap_ratio.append(r)
 
         vals = list(base.values)
+        if not overlap_idx:
+            scale = 1.0
+            for i, ev in enumerate(extra.values):
+                if cutoff_idx is not None and i >= cutoff_idx:
+                    continue
+                if vals[i] is None and ev is not None:
+                    vals[i] = ev * scale
+            return PriceSeries(symbol=symbol, values=vals)
+
+        cursor = 0
+        n_overlap = len(overlap_idx)
         for i, ev in enumerate(extra.values):
             if cutoff_idx is not None and i >= cutoff_idx:
                 continue
-            if vals[i] is None and ev is not None:
-                vals[i] = ev * scale
+            if vals[i] is not None or ev is None:
+                continue
+            while cursor + 1 < n_overlap and overlap_idx[cursor + 1] <= i:
+                cursor += 1
+            left_i = overlap_idx[cursor]
+            left_r = overlap_ratio[cursor]
+            if left_i > i:
+                # Missing point lies before the first overlap. Anchor to the
+                # first overlap so the first filled segment joins smoothly.
+                scale = left_r
+            elif cursor + 1 < n_overlap:
+                right_i = overlap_idx[cursor + 1]
+                right_r = overlap_ratio[cursor + 1]
+                scale = left_r if (i - left_i) <= (right_i - i) else right_r
+            else:
+                scale = left_r
+            vals[i] = ev * scale
         return PriceSeries(symbol=symbol, values=vals)
 
     def _throttle_testfolio(self) -> None:
@@ -1294,10 +1327,24 @@ class DataStore:
 
             direct = self._load_direct_symbol(symbol)
             merged = self._extend_with_letf_map(symbol, direct)
-            # Prefer local extended-price/SIM cache before jar or network fallback.
-            merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
-            merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
-            merged = self._extend_with_stitch_map(symbol, merged)
+
+            # Stitched volatility products (notably SVXY/VIXY/VIXM) must be
+            # extended by chaining proxy *returns* across the stitch boundary.
+            # Do this before consulting same-symbol extended CSV caches because
+            # older cache files can contain level-scaled stitches with artificial
+            # jumps at the SVIXSIM/UVXY?L boundary.  After the clean stitch is
+            # built, same-symbol CSV/API/Yahoo sources are used only to fill
+            # remaining holes, not to overwrite the continuous path.
+            if symbol in self.stitch_map:
+                merged = self._extend_with_stitch_map(symbol, merged)
+                merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
+                merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
+            else:
+                # Prefer local extended-price/SIM cache before jar or network fallback.
+                merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
+                merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
+                merged = self._extend_with_stitch_map(symbol, merged)
+
             merged = self._extend_with_testfolio_api(symbol, merged)
             merged = self._merge_fill_missing(symbol, merged, self._fetch_yahoo_history(symbol))
             if merged is not None:
