@@ -104,3 +104,36 @@ This version adds the decision-oriented portfolio tools from the Strategy Weight
 - **Research workbook export**: creates an XLSX workbook containing decision tables, candidate metrics, correlation requirements, stress breakpoints, frontier data, robustness outputs, and Monte Carlo comparison outputs.
 
 The app is still a decision-support tool, not a guarantee. Its strongest use is comparing candidate portfolios under explicit assumptions and showing where those assumptions break.
+
+## Rain upstream data and parity helpers
+
+This package includes the newer Rain upstream baseline under `config/rain/`:
+
+- `LetfMap.rain.json`: upstream Rain mapping table.
+- `testfolio-sim.rain.csv`: upstream Rain `Testfolio_SIM.csv` export.
+- `BacktestCLI.jar` and `BacktestReport.jar`: optional local Rain Java artifacts.
+
+Runtime mapping is deliberately **not** a blind replacement of local behavior. The effective map is:
+
+```text
+config/rain/LetfMap.rain.json
++ config/local/LetfMap.overrides.json
+= config/LetfMap.json / effective runtime map
+```
+
+Local overrides currently preserve intentional app-specific behavior such as UPRO drag metadata and custom mappings for UDN, BTAL, NTSD and FNGD.
+
+The sidebar exposes a **Rain data/pathing mode** selector:
+
+- `SYNTHETIC`: default Python engine behavior using Rain SIM/LetfMap mappings.
+- `NORMAL`: prefers direct/live history when available.
+- `DEFAULT_PATHING`: reserved for Rain parity checks; currently behaves closest to `SYNTHETIC` in the Python engine.
+
+Optional local parity tools:
+
+```bash
+python tools/rain_cli_compare.py --input strategy.json --output rain_out --mode SYNTHETIC
+python tools/scan_series_discontinuities.py --symbols UVIX,SVXY,VIXY,VIXM --threshold 3.0
+```
+
+The Rain CLI helper requires a Java runtime new enough for the uploaded Rain jar. Normal Streamlit/Python operation does not require Java.

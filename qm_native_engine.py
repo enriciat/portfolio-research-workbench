@@ -116,6 +116,7 @@ class DataStore:
     allow_non_letf_proxy: bool = False
     testfolio_sim_jar: Optional[Path] = None
     refresh_sim_cache: bool = False
+    rain_mode: str = "SYNTHETIC"
     extended_price_csvs: Tuple[Path, ...] = ()
     testfolio_cookie: str = ""
     testfolio_token: str = ""
@@ -136,6 +137,7 @@ class DataStore:
         "^BCOMGC": "GLD",
         "^VIX": "UVXY",
         "VIX": "UVXY",
+        "BRK/B": "BRK.B",
     })
     testfolio_sim_alias: Dict[str, str] = field(default_factory=lambda: {
         "TBILL": "CASHX",
@@ -275,6 +277,8 @@ class DataStore:
     letf_map: Dict[str, Dict[str, Any]] = field(init=False)
     series_cache: Dict[str, PriceSeries] = field(default_factory=dict)
     proxied_symbols: Dict[str, str] = field(default_factory=dict)
+    series_sources: Dict[str, str] = field(default_factory=dict)
+    stitch_warnings: List[str] = field(default_factory=list)
     _loading_symbols: set[str] = field(default_factory=set)
     _testfolio_call_count: int = 0
     _testfolio_fail_count: int = 0
@@ -300,7 +304,10 @@ class DataStore:
         self.market_days = self._load_market_days(self.config_dir / "MarketDays.dat")
         self.day_to_index = {d: i for i, d in enumerate(self.market_days)}
         self.epoch_to_index = {int((d - dt.date(1970, 1, 1)).days): i for i, d in enumerate(self.market_days)}
-        self.letf_map = self._load_letf_map(self.config_dir / "LetfMap.json")
+        self.rain_mode = str(self.rain_mode or "SYNTHETIC").upper().strip()
+        if self.rain_mode not in {"SYNTHETIC", "NORMAL", "DEFAULT_PATHING"}:
+            self.rain_mode = "SYNTHETIC"
+        self.letf_map = self._load_effective_letf_map()
         self._best_long_by_root, self._best_short_by_root = self._build_best_letf_maps()
         self._ssl_context = self._build_ssl_context()
         self._testfolio_sim_path = self._resolve_testfolio_sim_jar(self.testfolio_sim_jar)
@@ -321,6 +328,11 @@ class DataStore:
             "config_dir": str(self.config_dir),
             "market_days_file": str(self.config_dir / "MarketDays.dat"),
             "letf_map_file": str(self.config_dir / "LetfMap.json"),
+            "rain_mode": self.rain_mode,
+            "rain_letf_map_file": str(self.config_dir / "rain" / "LetfMap.rain.json"),
+            "local_letf_overrides_file": str(self.config_dir / "local" / "LetfMap.overrides.json"),
+            "rain_cli_jar": str(self.config_dir / "rain" / "BacktestCLI.jar"),
+            "rain_report_jar": str(self.config_dir / "rain" / "BacktestReport.jar"),
             "tickers_files": count_dat("tickers"),
             "ext_letf_files": count_dat("ext_letf"),
             "prices_files": count_dat("prices"),
@@ -340,7 +352,36 @@ class DataStore:
             "yahoo_fallback_enabled": self.use_yahoo_fallback,
             "yahoo_api_calls": self._yahoo_call_count,
             "yahoo_api_failures": self._yahoo_fail_count,
+            "series_sources": dict(sorted(self.series_sources.items())),
+            "stitch_warnings": list(self.stitch_warnings),
         }
+
+    def _load_effective_letf_map(self) -> Dict[str, Dict[str, Any]]:
+        """Load Rain baseline mappings plus local overrides when present.
+
+        ``config/rain/LetfMap.rain.json`` is the upstream Rain map.
+        ``config/local/LetfMap.overrides.json`` contains deliberate local behavior
+        such as UPRO drag metadata and custom tickers like UDN/BTAL.
+        If these files are absent, the legacy ``config/LetfMap.json`` is used.
+        """
+        rain_path = self.config_dir / "rain" / "LetfMap.rain.json"
+        override_path = self.config_dir / "local" / "LetfMap.overrides.json"
+        legacy_path = self.config_dir / "LetfMap.json"
+        if rain_path.exists():
+            rows = load_loose_json(rain_path)
+            out: Dict[str, Dict[str, Any]] = {}
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and row.get("ticker"):
+                        out[str(row["ticker"]).upper()] = dict(row)
+            if override_path.exists():
+                overrides = load_loose_json(override_path)
+                if isinstance(overrides, list):
+                    for row in overrides:
+                        if isinstance(row, dict) and row.get("ticker"):
+                            out[str(row["ticker"]).upper()] = dict(row)
+            return out
+        return self._load_letf_map(legacy_path)
 
     @staticmethod
     def _load_market_days(path: Path) -> List[Date]:
@@ -652,6 +693,7 @@ class DataStore:
         for candidate in self._testfolio_sim_candidates(symbol):
             series = table.get(candidate)
             if series is not None:
+                self._record_source(symbol, f"extended CSV/Testfolio SIM cache column {candidate}")
                 return PriceSeries(symbol=symbol, values=series.values)
         return None
 
@@ -691,6 +733,21 @@ class DataStore:
         vals = list(base.values)
         if not overlap_idx:
             scale = 1.0
+            base_valid = [i for i, v in enumerate(base.values) if v is not None]
+            extra_valid = [i for i, v in enumerate(extra.values) if v is not None and v != 0]
+            if base_valid and extra_valid:
+                last_base_before_extra = max((i for i in base_valid if i < extra_valid[0]), default=None)
+                first_extra_after_base = next((i for i in extra_valid if i > base_valid[-1]), None)
+                if last_base_before_extra is not None:
+                    ev = extra.values[extra_valid[0]]
+                    bv = base.values[last_base_before_extra]
+                    if ev and bv:
+                        scale = bv / ev
+                elif first_extra_after_base is not None:
+                    ev = extra.values[first_extra_after_base]
+                    bv = base.values[base_valid[-1]]
+                    if ev and bv:
+                        scale = bv / ev
             for i, ev in enumerate(extra.values):
                 if cutoff_idx is not None and i >= cutoff_idx:
                     continue
@@ -1085,6 +1142,36 @@ class DataStore:
                     vals[i] = v * scale
         return PriceSeries(symbol=symbol, values=vals)
 
+    def _record_source(self, symbol: str, source: str) -> None:
+        if symbol and source:
+            self.series_sources[str(symbol).upper()] = source
+
+    def _scan_discontinuity(self, symbol: str, series: Optional[PriceSeries], threshold: float = 3.0) -> None:
+        """Flag suspicious one-day jumps in stitched/SIM-like series.
+
+        This is diagnostic only.  The threshold is intentionally high so real
+        volatility events can still pass, but obvious stitch breaks are visible.
+        """
+        if series is None or not series.values:
+            return
+        key = str(symbol).upper()
+        if any(w.startswith(f"Stitch check: {key} ") for w in self.stitch_warnings):
+            return
+        worst_i = None
+        worst_r = 0.0
+        vals = series.values
+        for i in range(1, len(vals)):
+            p0, p1 = vals[i - 1], vals[i]
+            if p0 is None or p1 is None or p0 == 0:
+                continue
+            r = p1 / p0 - 1.0
+            if math.isfinite(r) and abs(r) > abs(worst_r):
+                worst_r = r
+                worst_i = i
+        if worst_i is not None and abs(worst_r) >= threshold:
+            d = self.market_days[worst_i].isoformat()
+            self.stitch_warnings.append(f"Stitch check: {key} has {worst_r:+.2%} one-day move on {d}; verify source/proxy continuity.")
+
     def _load_direct_symbol(self, symbol: str) -> Optional[PriceSeries]:
         # Priority: historical tickers (long) -> ext_letf -> prices (recent override)
         locations = [
@@ -1098,7 +1185,9 @@ class DataStore:
                 parts.append(self._read_dat_file(p, symbol))
         if not parts:
             return None
-        return self._merge_series(symbol, parts)
+        merged = self._merge_series(symbol, parts)
+        self._record_source(symbol, "local dat cache: tickers/ext_letf/prices")
+        return merged
 
     def _build_ratio_series(self, symbol: str, lhs: str, rhs: str) -> Optional[PriceSeries]:
         l = self.load_symbol(lhs)
@@ -1136,6 +1225,10 @@ class DataStore:
             vals[i] = prev * (1.0 + leverage * r)
         return PriceSeries(symbol=symbol, values=vals)
 
+    @staticmethod
+    def _is_sim_underlying(symbol: str) -> bool:
+        return bool(re.search(r"SIM\d*$", str(symbol).upper().strip()))
+
     def _extend_with_letf_map(self, symbol: str, direct: Optional[PriceSeries]) -> Optional[PriceSeries]:
         row = self.letf_map.get(symbol)
         if not row:
@@ -1144,6 +1237,10 @@ class DataStore:
         underlying = str(row.get("underlying", "")).upper().strip()
         lev = safe_float(row.get("leverage", 1.0), 1.0)
         if not underlying:
+            return direct
+
+        if self.rain_mode == "NORMAL" and direct is not None:
+            self._record_source(symbol, "NORMAL mode direct/live cache; LETF synthetic extension skipped")
             return direct
 
         # Build synthetic from underlying and leverage.
@@ -1155,14 +1252,20 @@ class DataStore:
         # return stream as the authoritative source.  Mixing a SIM prehistory with
         # live ETF prices by median scaling can create artificial stitch jumps
         # around ETF inception (seen for QQQ/SVIX and potentially others).
-        if underlying.endswith("SIM"):
+        if self._is_sim_underlying(underlying):
+            self._record_source(symbol, f"LetfMap SIM synthetic: {symbol}->{underlying} leverage {lev:g}")
+            if direct is not None:
+                self._record_source(symbol, f"LetfMap SIM synthetic plus direct/live fill: {symbol}->{underlying} leverage {lev:g}")
+                return self._merge_fill_missing(symbol, synthetic, direct)
             return synthetic
 
         if direct is None:
+            self._record_source(symbol, f"LetfMap synthetic: {symbol}->{underlying} leverage {lev:g}")
             return synthetic
         # Scale-align synthetic LETF history to the direct series before filling
         # any gaps. This avoids large nominal jumps when direct history ends
         # or has holes inside the live range for non-SIM synthetic extensions.
+        self._record_source(symbol, f"direct cache extended with LetfMap synthetic: {symbol}->{underlying} leverage {lev:g}")
         return self._merge_fill_missing(symbol, direct, synthetic)
 
     def _extend_with_stitch_map(self, symbol: str, base: Optional[PriceSeries]) -> Optional[PriceSeries]:
@@ -1177,6 +1280,7 @@ class DataStore:
         base_first = base.first_index() if base is not None else None
         if merged is not None and proxy_first is not None and (base_first is None or proxy_first < base_first):
             self.proxied_symbols[symbol] = proxy
+            self._record_source(symbol, f"stitched with proxy returns from {proxy}")
         return merged
 
     def _merge_with_proxy_returns(
@@ -1303,6 +1407,8 @@ class DataStore:
                 lev = safe_float(qmatch.group(2), 1.0)
                 s = self._build_levered_view(symbol, base, lev)
                 if s is not None:
+                    self._record_source(symbol, f"dynamic leverage view {base} x {lev:g}")
+                    self._scan_discontinuity(symbol, s)
                     self.series_cache[symbol] = s
                 return s
 
@@ -1311,6 +1417,8 @@ class DataStore:
                 lhs, rhs = symbol.split("/", 1)
                 s = self._build_ratio_series(symbol, lhs.strip().upper(), rhs.strip().upper())
                 if s is not None:
+                    self._record_source(symbol, f"ratio series {lhs.strip().upper()}/{rhs.strip().upper()}")
+                    self._scan_discontinuity(symbol, s)
                     self.series_cache[symbol] = s
                 return s
 
@@ -1322,10 +1430,13 @@ class DataStore:
                 if sim_direct is None:
                     sim_direct = self._fetch_testfolio_sim_history(symbol)
                 if sim_direct is not None:
+                    self._scan_discontinuity(symbol, sim_direct)
                     self.series_cache[symbol] = sim_direct
                     return sim_direct
 
             direct = self._load_direct_symbol(symbol)
+            map_row = self.letf_map.get(symbol)
+            mapped_sim_underlying = bool(map_row and self._is_sim_underlying(str(map_row.get("underlying", ""))))
             merged = self._extend_with_letf_map(symbol, direct)
 
             # Stitched volatility products (notably SVXY/VIXY/VIXM) must be
@@ -1340,14 +1451,19 @@ class DataStore:
                 merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
                 merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
             else:
-                # Prefer local extended-price/SIM cache before jar or network fallback.
-                merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
-                merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
+                # Prefer the explicit LETF SIM underlying when the Rain/local map
+                # declares one (e.g. UVIX -> UVIXSIM2).  Do not later backfill
+                # from same-symbol aliases such as UVIXSIM, because that can
+                # silently undo Rain's pathing split.
+                if not mapped_sim_underlying:
+                    merged = self._merge_fill_missing(symbol, merged, self._fetch_external_csv_history(symbol))
+                    merged = self._merge_fill_missing(symbol, merged, self._fetch_testfolio_sim_history(symbol))
                 merged = self._extend_with_stitch_map(symbol, merged)
 
             merged = self._extend_with_testfolio_api(symbol, merged)
             merged = self._merge_fill_missing(symbol, merged, self._fetch_yahoo_history(symbol))
             if merged is not None:
+                self._scan_discontinuity(symbol, merged)
                 self.series_cache[symbol] = merged
                 return merged
 
@@ -1356,6 +1472,8 @@ class DataStore:
                 base = self.load_symbol(letf_proxy)
                 if base is not None:
                     proxied = PriceSeries(symbol=symbol, values=base.values)
+                    self._record_source(symbol, f"replacement proxy {letf_proxy}")
+                    self._scan_discontinuity(symbol, proxied)
                     self.series_cache[symbol] = proxied
                     self.proxied_symbols[symbol] = letf_proxy
                     return proxied
@@ -2291,6 +2409,7 @@ class QMBacktester:
                         "first_date": None,
                         "last_date": None,
                         "proxied_to": proxied_to,
+                        "source": self.store.series_sources.get(sym, ""),
                         "missing": True,
                     }
                 )
@@ -2307,6 +2426,7 @@ class QMBacktester:
                     "first_date": fd.isoformat() if fd is not None else None,
                     "last_date": ld.isoformat() if ld is not None else None,
                     "proxied_to": proxied_to,
+                    "source": self.store.series_sources.get(sym, ""),
                     "missing": fi is None,
                 }
             )
@@ -2389,7 +2509,7 @@ class QMBacktester:
         source_type = str(data_source.get("type") or "unknown")
         self.warn(
             f"Data source: {source_type}"
-            f" (config={data_source.get('config_dir')}; "
+            f" (mode={data_source.get('rain_mode')}; config={data_source.get('config_dir')}; "
             f"tickers={data_source.get('tickers_files')}, "
             f"ext_letf={data_source.get('ext_letf_files')}, "
             f"prices={data_source.get('prices_files')}; "
@@ -2417,6 +2537,15 @@ class QMBacktester:
                 "Symbols missing from local cache (do not contribute to start-date constraint): "
                 + ", ".join(missing_symbols)
             )
+
+        if data_source.get("stitch_warnings"):
+            for w in data_source.get("stitch_warnings") or []:
+                self.warn(str(w))
+        src_map = data_source.get("series_sources") or {}
+        for sym in sorted(used_symbols):
+            src_desc = src_map.get(sym.upper())
+            if src_desc:
+                self.warn(f"Source provenance: {sym.upper()} -> {src_desc}.")
 
         # Rebalance configuration
         trading_type = str(qm.get("trading_type") or "Threshold")
@@ -2552,7 +2681,7 @@ def write_symbol_coverage_csv(path: Path, out: BacktestOutput) -> None:
     )
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Symbol", "First Date", "Last Date", "Proxied To", "Missing", "Limits Start"])
+        w.writerow(["Symbol", "First Date", "Last Date", "Proxied To", "Source", "Missing", "Limits Start"])
         for r in rows:
             sym = str(r.get("symbol") or "")
             w.writerow(
@@ -2561,6 +2690,7 @@ def write_symbol_coverage_csv(path: Path, out: BacktestOutput) -> None:
                     r.get("first_date") or "",
                     r.get("last_date") or "",
                     r.get("proxied_to") or "",
+                    r.get("source") or "",
                     "yes" if r.get("missing") else "no",
                     "yes" if sym in limiting_set else "no",
                 ]
@@ -2576,7 +2706,12 @@ def build_start_diagnostics_lines(out: BacktestOutput) -> List[str]:
         f"warmup_trading_days={out.warmup_days}",
         f"limiting_symbols={','.join(out.limiting_symbols) if out.limiting_symbols else ''}",
         f"data_source_type={src.get('type') or ''}",
+        f"rain_mode={src.get('rain_mode') or ''}",
         f"data_source_config={src.get('config_dir') or ''}",
+        f"rain_letf_map={src.get('rain_letf_map_file') or ''}",
+        f"local_letf_overrides={src.get('local_letf_overrides_file') or ''}",
+        f"rain_cli_jar={src.get('rain_cli_jar') or ''}",
+        f"rain_report_jar={src.get('rain_report_jar') or ''}",
         f"data_source_tickers_files={src.get('tickers_files') or 0}",
         f"data_source_ext_letf_files={src.get('ext_letf_files') or 0}",
         f"data_source_prices_files={src.get('prices_files') or 0}",
@@ -2591,6 +2726,10 @@ def build_start_diagnostics_lines(out: BacktestOutput) -> List[str]:
         f"yahoo_api_calls={src.get('yahoo_api_calls') or 0}",
         f"yahoo_api_failures={src.get('yahoo_api_failures') or 0}",
     ]
+    for sym, desc in sorted((src.get("series_sources") or {}).items()):
+        lines.append(f"source_{sym}={desc}")
+    for i, warn in enumerate(src.get("stitch_warnings") or [], start=1):
+        lines.append(f"stitch_warning_{i}={warn}")
     return lines
 
 
@@ -3377,6 +3516,7 @@ def _append_diagnostics_to_report(path: Path, out: BacktestOutput) -> None:
             f"<td>{html.escape(first_date)}</td>"
             f"<td>{html.escape(last_date)}</td>"
             f"<td>{html.escape(proxied)}</td>"
+            f"<td>{html.escape(str(r.get('source') or '-'))}</td>"
             f"<td>{html.escape(missing)}</td>"
             f"<td>{html.escape(limits)}</td>"
             "</tr>"
@@ -3638,6 +3778,7 @@ def run_cli() -> int:
     p.add_argument("--allow-non-letf-proxy", action="store_true", help="Allow heuristic/non-LetfMap proxy substitutions")
     p.add_argument("--testfolio-sim-jar", default="", help="Optional BacktestReport.jar path for local Testfolio_SIM.csv history")
     p.add_argument("--refresh-sim-cache", action="store_true", help="Rebuild config/extended_prices/testfolio-sim.csv from BacktestReport.jar before running")
+    p.add_argument("--rain-mode", choices=["SYNTHETIC", "NORMAL", "DEFAULT_PATHING"], default="SYNTHETIC", help="Rain-style data/pathing mode. SYNTHETIC is the Python engine default.")
     p.add_argument("--extended-price-csv", action="append", default=[], help="Optional wide CSV with Date column and one symbol per column")
     p.add_argument("--testfolio-api-url", default="https://testfol.io/api/tactical", help="Testfolio tactical endpoint")
     p.add_argument("--testfolio-timeout", type=float, default=40.0, help="Testfolio API timeout in seconds")
@@ -3663,6 +3804,7 @@ def run_cli() -> int:
         allow_non_letf_proxy=bool(args.allow_non_letf_proxy),
         testfolio_sim_jar=Path(args.testfolio_sim_jar).expanduser() if args.testfolio_sim_jar else None,
         refresh_sim_cache=bool(args.refresh_sim_cache),
+        rain_mode=str(args.rain_mode or "SYNTHETIC"),
         extended_price_csvs=tuple(Path(p).expanduser() for p in (args.extended_price_csv or [])),
         testfolio_cookie=str(args.testfolio_cookie or os.environ.get("TESTFOLIO_COOKIE", "")),
         testfolio_token=str(args.testfolio_token or os.environ.get("TESTFOLIO_TOKEN", "")),

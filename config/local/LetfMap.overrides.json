@@ -1,0 +1,54 @@
+[
+  {
+    "ticker": "BTAL",
+    "underlying": "BTALSIM",
+    "leverage": 1
+  },
+  {
+    "ticker": "CLDL",
+    "underlying": "WCLD",
+    "leverage": 2
+  },
+  {
+    "ticker": "CLDS",
+    "underlying": "WCLD",
+    "leverage": -2
+  },
+  {
+    "ticker": "FNGD",
+    "underlying": "FNGUSIM",
+    "leverage": -1
+  },
+  {
+    "ticker": "NTSD",
+    "underlying": "NTSDSIM",
+    "leverage": 1
+  },
+  {
+    "ticker": "OOTO",
+    "underlying": "AWAY",
+    "leverage": 2
+  },
+  {
+    "ticker": "QPUX",
+    "underlying": "PUREQ",
+    "leverage": 2
+  },
+  {
+    "ticker": "UDN",
+    "underlying": "UDNSIM",
+    "leverage": 1
+  },
+  {
+    "ticker": "UPRO",
+    "underlying": "SPY",
+    "leverage": 3,
+    "swapExposure": 1.2,
+    "expenseRatio": 0.9
+  },
+  {
+    "ticker": "VIX",
+    "underlying": "VIXSIM",
+    "leverage": 1
+  }
+]

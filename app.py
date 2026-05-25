@@ -302,6 +302,7 @@ def run_engine_task(
     cookie: str,
     token: str,
     refresh_sim_cache: bool = False,
+    rain_mode: str = "SYNTHETIC",
 ) -> Tuple[BacktestTask, int, str, str, float, str]:
     task_dir.mkdir(parents=True, exist_ok=True)
     input_path = task_dir / task.input_file_name
@@ -322,6 +323,8 @@ def run_engine_task(
         str(float(timeout_sec)),
         "--testfolio-retries",
         str(int(retries)),
+        "--rain-mode",
+        str(rain_mode or "SYNTHETIC"),
     ]
     if benchmark.strip():
         cmd += ["--benchmark", benchmark.strip().upper()]
@@ -415,6 +418,7 @@ def run_backtest_batch(
     cookie: str,
     token: str,
     refresh_sim_cache: bool,
+    rain_mode: str,
     parallel_strategy_level: bool,
     max_workers: int,
     selected_strategy_keys: Optional[List[str]] = None,
@@ -466,7 +470,7 @@ def run_backtest_batch(
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = []
             for task in tasks:
-                futures.append(ex.submit(run_engine_task, task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token, refresh_sim_cache))
+                futures.append(ex.submit(run_engine_task, task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token, refresh_sim_cache, rain_mode))
             for fut in as_completed(futures):
                 try:
                     process_tuple(fut.result())
@@ -476,7 +480,7 @@ def run_backtest_batch(
                     completed += 1
     else:
         for task in tasks:
-            process_tuple(run_engine_task(task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token, refresh_sim_cache))
+            process_tuple(run_engine_task(task, task_root / f"task_{task.task_id}", benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, timeout_sec, retries, cookie, token, refresh_sim_cache, rain_mode))
 
     index = build_index_from_outputs(merged_out)
     files_before = collect_output_files(merged_out)
@@ -2306,6 +2310,7 @@ def main() -> None:
         strict = st.checkbox("Strict mode", value=False, help="Fail if the compiler emits warnings.")
         allow_non_letf_proxy = st.checkbox("Allow non-LetfMap heuristic proxies", value=False)
         refresh_sim_cache = st.checkbox("Refresh local Testfolio SIM cache from BacktestReport.jar", value=False, help="Only needed when a local BacktestReport.jar is available and you want to rebuild config/extended_prices/testfolio-sim.csv.")
+        rain_mode = st.selectbox("Rain data/pathing mode", ["SYNTHETIC", "NORMAL", "DEFAULT_PATHING"], index=0, help="SYNTHETIC matches the Python engine default and uses Rain SIM/LetfMap mappings. NORMAL prefers direct/live history when available. DEFAULT_PATHING is reserved for Rain parity checks and currently behaves like SYNTHETIC.")
         st.divider()
         st.subheader("Parallel execution")
         parallel_strategy_level = st.checkbox("Parallelize individual strategies", value=True)
@@ -2464,7 +2469,7 @@ def main() -> None:
             with st.status("Running backtest engine…", expanded=True) as status:
                 progress = st.progress(0.0, text="Starting backtest tasks…")
                 try:
-                    run = run_backtest_batch(uploaded_payloads, benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, int(timeout_sec), int(retries), cookie, token, bool(refresh_sim_cache), parallel_strategy_level, int(max_workers), selected_strategy_keys=selected_keys if selected_keys else None, progress_placeholder=progress)
+                    run = run_backtest_batch(uploaded_payloads, benchmark, chart_benchmark, strict, use_testfolio_api, use_yahoo_fallback, allow_non_letf_proxy, int(timeout_sec), int(retries), cookie, token, bool(refresh_sim_cache), str(rain_mode), parallel_strategy_level, int(max_workers), selected_strategy_keys=selected_keys if selected_keys else None, progress_placeholder=progress)
                     if merge_with_existing and previous_run is not None:
                         run = merge_backtest_runs(previous_run, run)
                     st.session_state["last_run"] = run
