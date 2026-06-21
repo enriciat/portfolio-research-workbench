@@ -1873,11 +1873,10 @@ class QMCompiler:
             return "CASHX"
         su = s.upper()
 
-        # QuantMage condition pseudo-symbols like `Subspell "Else"` are logic references,
-        # not tradable market symbols. Keep them out of symbol coverage/start constraints.
+        # QuantMage subspell pseudo-symbols are resolved at evaluation time,
+        # where the parent node can tell us which child branch is being named.
         if su.startswith("SUBSPELL"):
-            self.warn(where, f"subspell reference '{s}' is not a market symbol; using CASHX approximation")
-            return "CASHX"
+            return s
 
         self.symbols.add(su)
         return su
@@ -2046,6 +2045,9 @@ class QMBacktester:
         self.runtime_warnings: List[str] = []
         self._missing_symbol_warned: set[str] = set()
         self._proxied_symbol_warned: set[str] = set()
+        self._subspell_warned: set[str] = set()
+        self._subspell_series_cache: Dict[int, PriceSeries] = {}
+        self._subspell_building: set[int] = set()
 
     def warn(self, msg: str) -> None:
         self.runtime_warnings.append(msg)
@@ -2096,10 +2098,112 @@ class QMBacktester:
                 out[sym] = out.get(sym, 0.0) + aw * nw
         return self._normalize_alloc(out)
 
-    def _indicator_from_expr(self, expr: Dict[str, Any], symbol: str, idx: int) -> Optional[float]:
+    @staticmethod
+    def _subspell_ref(symbol: str) -> Optional[str]:
+        text = str(symbol or "").strip()
+        if not text.upper().startswith("SUBSPELL"):
+            return None
+        m = re.search(r'"([^"]+)"', text)
+        label = m.group(1) if m else text[len("Subspell") :].strip()
+        label = label.strip().strip("'\"")
+        return label.upper() if label else None
+
+    @staticmethod
+    def _subspell_cache_symbol(node: Dict[str, Any]) -> str:
+        return f"__SUBSPELL_{int(node.get('node_id', 0))}__"
+
+    def _warn_subspell_once(self, key: str, msg: str) -> None:
+        if key not in self._subspell_warned:
+            self._subspell_warned.add(key)
+            self.warn(msg)
+
+    def _reset_subspell_state(self) -> None:
+        symbols = {ps.symbol for ps in self._subspell_series_cache.values()}
+        symbols.update(sym for sym in self.store.series_cache if str(sym).startswith("__SUBSPELL_"))
+        for sym in symbols:
+            self.store.series_cache.pop(sym, None)
+            self.store.series_sources.pop(sym, None)
+        self.ind.cache = {k: v for k, v in self.ind.cache.items() if not str(k[1]).startswith("__SUBSPELL_")}
+        self._subspell_warned.clear()
+        self._subspell_series_cache.clear()
+        self._subspell_building.clear()
+
+    def _subspell_equity_series(self, node: Dict[str, Any]) -> Optional[PriceSeries]:
+        node_id = int(node.get("node_id", 0))
+        if node_id <= 0:
+            return None
+        if node_id in self._subspell_series_cache:
+            return self._subspell_series_cache[node_id]
+        if node_id in self._subspell_building:
+            self._warn_subspell_once(
+                f"recursive:{node_id}",
+                f"Recursive subspell reference at node {node_id}; subspell indicator treated as unavailable.",
+            )
+            return None
+
+        self._subspell_building.add(node_id)
+        try:
+            values: List[Optional[float]] = [None] * len(self.store.market_days)
+            state: Dict[int, bool] = {}
+            alloc: Dict[str, float] = {}
+            equity = 1.0
+            for idx in range(len(self.store.market_days)):
+                if idx > 0:
+                    equity *= 1.0 + self._portfolio_return(alloc, idx)
+                    alloc = self._drift_allocation(alloc, idx)
+                values[idx] = equity
+                target = self._eval_node(node, idx, state)
+                alloc = self._normalize_alloc(target or {})
+            ps = PriceSeries(symbol=self._subspell_cache_symbol(node), values=values)
+            self._subspell_series_cache[node_id] = ps
+            self.store.series_cache[ps.symbol] = ps
+            self.store.series_sources[ps.symbol] = f"isolated QuantMage subspell node {node_id}"
+            return ps
+        finally:
+            self._subspell_building.discard(node_id)
+
+    def _resolve_subspell_symbol(self, symbol: str, subspell_context: Optional[Dict[str, Dict[str, Any]]]) -> Optional[str]:
+        label = self._subspell_ref(symbol)
+        if label is None:
+            return str(symbol or "CASHX")
+        node = (subspell_context or {}).get(label)
+        if node is None:
+            self._warn_subspell_once(
+                f"missing:{label}",
+                f"Subspell \"{label.title()}\" was referenced outside a matching parent context; indicator treated as unavailable.",
+            )
+            return None
+        ps = self._subspell_equity_series(node)
+        return ps.symbol if ps is not None else None
+
+    def _indicator_array_for_symbol(
+        self,
+        expr: Dict[str, Any],
+        symbol: str,
+        subspell_context: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[Optional[float]]:
+        resolved = self._resolve_subspell_symbol(symbol, subspell_context)
+        if resolved is None:
+            return [None] * len(self.store.market_days)
+        return self.ind.indicator_array(
+            str(expr.get("type", "CurrentPrice")),
+            resolved,
+            max(0, safe_int(expr.get("window"), 0)),
+        )
+
+    def _indicator_from_expr(
+        self,
+        expr: Dict[str, Any],
+        symbol: str,
+        idx: int,
+        subspell_context: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Optional[float]:
         ind_type = str(expr.get("type", "CurrentPrice"))
         window = max(0, safe_int(expr.get("window"), 0))
-        return self.ind.indicator_value(ind_type, symbol, window, idx)
+        resolved = self._resolve_subspell_symbol(symbol, subspell_context)
+        if resolved is None:
+            return None
+        return self.ind.indicator_value(ind_type, resolved, window, idx)
 
     def _percentile_rank(self, arr: List[Optional[float]], idx: int, lookback: int) -> Optional[float]:
         if idx < 0:
@@ -2129,7 +2233,7 @@ class QMBacktester:
             return 50.0
         return ((cur - mn) / (mx - mn)) * 100.0
 
-    def _eval_single_condition(self, cond: Dict[str, Any], idx: int) -> bool:
+    def _eval_single_condition(self, cond: Dict[str, Any], idx: int, subspell_context: Optional[Dict[str, Dict[str, Any]]] = None) -> bool:
         kind = str(cond.get("type", "IndicatorAndNumber"))
         gt = bool(cond.get("greater_than", True))
         for_days = max(1, safe_int(cond.get("for_days"), 1))
@@ -2145,11 +2249,11 @@ class QMBacktester:
             lhs_sym = str(cond.get("lh_ticker_symbol") or "CASHX")
             rhs_sym = str(cond.get("rh_ticker_symbol") or "CASHX")
 
-            lhs = self._indicator_from_expr(lhs_expr, lhs_sym, lhs_idx)
+            lhs = self._indicator_from_expr(lhs_expr, lhs_sym, lhs_idx, subspell_context)
             rhs: Optional[float]
 
             if kind == "BothIndicators":
-                base_rhs = self._indicator_from_expr(rhs_expr, rhs_sym, rhs_idx)
+                base_rhs = self._indicator_from_expr(rhs_expr, rhs_sym, rhs_idx, subspell_context)
                 if base_rhs is None:
                     return False
                 rhs = base_rhs * safe_float(cond.get("rh_weight"), 1.0) + safe_float(cond.get("rh_bias"), 0.0)
@@ -2160,7 +2264,7 @@ class QMBacktester:
 
             elif kind in {"IndicatorPercentile", "IndicatorStochastic"}:
                 lookback = max(2, safe_int(cond.get("rh_value_int"), 100))
-                arr = self.ind.indicator_array(str(lhs_expr.get("type", "CurrentPrice")), lhs_sym, max(0, safe_int(lhs_expr.get("window"), 0)))
+                arr = self._indicator_array_for_symbol(lhs_expr, lhs_sym, subspell_context)
                 if kind == "IndicatorPercentile":
                     lhs = self._percentile_rank(arr, lhs_idx, lookback)
                 else:
@@ -2180,14 +2284,14 @@ class QMBacktester:
                 return False
         return True
 
-    def _eval_condition(self, cond: Dict[str, Any], idx: int) -> bool:
+    def _eval_condition(self, cond: Dict[str, Any], idx: int, subspell_context: Optional[Dict[str, Dict[str, Any]]] = None) -> bool:
         ctype = cond.get("condition_type")
         if ctype == "AllOf":
-            return all(self._eval_condition(c, idx) for c in cond.get("conditions") or [])
+            return all(self._eval_condition(c, idx, subspell_context) for c in cond.get("conditions") or [])
         if ctype == "AnyOf":
-            return any(self._eval_condition(c, idx) for c in cond.get("conditions") or [])
+            return any(self._eval_condition(c, idx, subspell_context) for c in cond.get("conditions") or [])
         if ctype == "SingleCondition":
-            return self._eval_single_condition(cond, idx)
+            return self._eval_single_condition(cond, idx, subspell_context)
         if ctype == "AlwaysFalse":
             return False
         return False
@@ -2212,6 +2316,27 @@ class QMBacktester:
             return 0.0
         return statistics.pstdev(rs) * 100.0
 
+    @staticmethod
+    def _price_series_volatility(series: Optional[PriceSeries], idx: int, window: int) -> float:
+        if series is None:
+            return 0.0
+        lo = max(1, idx - max(2, window) + 1)
+        rs: List[float] = []
+        for d in range(lo, idx + 1):
+            p0 = series.values[d - 1]
+            p1 = series.values[d]
+            if p0 is None or p1 is None or p0 == 0:
+                continue
+            rs.append((p1 / p0) - 1.0)
+        if len(rs) < 2:
+            return 0.0
+        return statistics.pstdev(rs) * 100.0
+
+    def _child_inverse_volatility(self, child: Dict[str, Any], alloc: Optional[Dict[str, float]], idx: int, window: int) -> float:
+        if child.get("node_type") == "Ticker":
+            return self._child_volatility(alloc, idx, window)
+        return self._price_series_volatility(self._subspell_equity_series(child), idx, window)
+
     def _eval_node(self, node: Dict[str, Any], idx: int, state: Dict[int, bool]) -> Optional[Dict[str, float]]:
         t = node.get("node_type")
 
@@ -2234,7 +2359,8 @@ class QMBacktester:
 
         if t == "IfElse":
             cond = node.get("condition") or {}
-            branch = node.get("then") if self._eval_condition(cond, idx) else node.get("else")
+            ctx = {"THEN": node.get("then"), "ELSE": node.get("else")}
+            branch = node.get("then") if self._eval_condition(cond, idx, ctx) else node.get("else")
             return self._eval_node(branch, idx, state)
 
         if t == "Switch":
@@ -2261,11 +2387,12 @@ class QMBacktester:
             in_pos = bool(state.get(nid, False))
             enter_cond = node.get("enter_condition") or {}
             exit_cond = node.get("exit_condition") or {}
+            ctx = {"ENTER": node.get("enter"), "EXIT": node.get("exit")}
             if in_pos:
-                if self._eval_condition(exit_cond, idx):
+                if self._eval_condition(exit_cond, idx, ctx):
                     in_pos = False
             else:
-                if self._eval_condition(enter_cond, idx):
+                if self._eval_condition(enter_cond, idx, ctx):
                     in_pos = True
             state[nid] = in_pos
             return self._eval_node(node.get("enter") if in_pos else node.get("exit"), idx, state)
@@ -2273,7 +2400,8 @@ class QMBacktester:
         if t == "Mixed":
             ind = node.get("indicator") or {"type": "RelativeStrengthIndex", "window": 14}
             symbol = str(node.get("ticker_symbol") or "CASHX")
-            x = self._indicator_from_expr(ind, symbol, idx)
+            ctx = {"FROM": node.get("from"), "TO": node.get("to")}
+            x = self._indicator_from_expr(ind, symbol, idx, ctx)
             if x is None:
                 return self._eval_node(node.get("to"), idx, state)
 
@@ -2323,7 +2451,7 @@ class QMBacktester:
             for a, c in child_allocs:
                 if a is None:
                     continue
-                vol = self._child_volatility(a, idx, win)
+                vol = self._child_inverse_volatility(c, a, idx, win)
                 if vol <= 0:
                     continue
                 parts_iv.append((a, 1.0 / vol))
@@ -2344,19 +2472,8 @@ class QMBacktester:
                     sym = str(c.get("symbol") or "CASHX")
                     score = self._indicator_from_expr(sort_ind, sym, idx)
                 else:
-                    # Weighted average indicator over currently selected child exposure.
-                    score = None
-                    if a:
-                        num = 0.0
-                        den = 0.0
-                        for sym, w in a.items():
-                            sv = self._indicator_from_expr(sort_ind, sym, idx)
-                            if sv is None:
-                                continue
-                            num += w * sv
-                            den += w
-                        if den > 0:
-                            score = num / den
+                    ps = self._subspell_equity_series(c)
+                    score = self._indicator_from_expr(sort_ind, ps.symbol, idx) if ps is not None else None
                 if score is None:
                     score = -float("inf") if not bottom else float("inf")
                 scored.append((float(score), a, c))
@@ -2387,7 +2504,7 @@ class QMBacktester:
             win = max(2, safe_int(node.get("inverse_volatility_window"), 20))
             parts_iv: List[Tuple[Optional[Dict[str, float]], float]] = []
             for _score, a, c in selected:
-                vol = self._child_volatility(a, idx, win)
+                vol = self._child_inverse_volatility(c, a, idx, win)
                 if vol <= 0:
                     continue
                 parts_iv.append((a, 1.0 / vol))
@@ -2479,6 +2596,7 @@ class QMBacktester:
         benchmark: Optional[str] = None,
         chart_benchmark: Optional[str] = None,
     ) -> BacktestOutput:
+        self._reset_subspell_state()
         compiler = QMCompiler()
         cres = compiler.compile_strategy(qm)
 
