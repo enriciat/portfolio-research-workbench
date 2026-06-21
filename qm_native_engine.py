@@ -270,6 +270,13 @@ class DataStore:
         "VIXY": "UVXY?L=0.5",
         "VIXM": "UVXY?L=0.25",
     })
+    index_prehistory_map: Dict[str, str] = field(default_factory=lambda: {
+        # Extend SOXX-based semiconductor histories with PHLX Semiconductor
+        # index returns before the ETF cache begins.  The merge is return-based
+        # and only backfills missing prehistory, so SOXX/SOXL keep direct/live
+        # history where available and avoid a level jump at the stitch.
+        "SOXX": "^SOX",
+    })
 
     market_days: List[Date] = field(init=False)
     day_to_index: Dict[Date, int] = field(init=False)
@@ -1283,6 +1290,20 @@ class DataStore:
             self._record_source(symbol, f"stitched with proxy returns from {proxy}")
         return merged
 
+    def _extend_with_index_prehistory(self, symbol: str, base: Optional[PriceSeries]) -> Optional[PriceSeries]:
+        proxy = str(self.index_prehistory_map.get(symbol, "")).upper().strip()
+        if not proxy or proxy == symbol:
+            return base
+        proxy_series = self._fetch_yahoo_history(proxy)
+        if proxy_series is None:
+            return base
+        merged = self._merge_with_proxy_returns(symbol, base, proxy_series)
+        proxy_first = proxy_series.first_index()
+        base_first = base.first_index() if base is not None else None
+        if merged is not None and proxy_first is not None and (base_first is None or proxy_first < base_first):
+            self._record_source(symbol, f"direct cache return-backfilled with index proxy {proxy}")
+        return merged
+
     def _merge_with_proxy_returns(
         self,
         symbol: str,
@@ -1435,6 +1456,7 @@ class DataStore:
                     return sim_direct
 
             direct = self._load_direct_symbol(symbol)
+            direct = self._extend_with_index_prehistory(symbol, direct)
             map_row = self.letf_map.get(symbol)
             mapped_sim_underlying = bool(map_row and self._is_sim_underlying(str(map_row.get("underlying", ""))))
             merged = self._extend_with_letf_map(symbol, direct)
